@@ -1,4 +1,5 @@
 crewai[tools]>=0.70.0
+langchain
 litellm
 fastapi
 apscheduler

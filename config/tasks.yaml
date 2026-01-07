@@ -1,7 +1,7 @@
-extract_devis_data:
+read_pdf_and_extract_data:
     description: >
-        Analysez le fichier PDF de devis fourni et extrayez toutes les informations
-        pour créer un fichier JSON structuré. Vous devez identifier et extraire :
+        Lisez le fichier PDF de devis fourni et extrayez toutes les informations
+        pour créer un objet JSON structuré. Vous devez identifier et extraire :
 
         1. Le numéro de devis (format généralement DEV-XXXX ou similaire)
         2. La date d'émission (format JJ/MM/AAAA)
@@ -23,12 +23,16 @@ extract_devis_data:
            - Mode de paiement (ex: "Virement bancaire", "Chèque")
         8. Le nom du fichier source (nom du PDF original)
 
+        PROCÉDURE :
+        1. Utiliser l'outil 'read_pdf_file' avec l'argument file_path fourni.
+        2. Analyser le contenu extrait et structurer les données en objet JSON (Python dict).
+
         Le JSON doit être valide et suivre exactement la structure fournie en exemple.
         Tous les champs numériques doivent être des nombres (pas de chaînes).
         Les dates doivent être au format JJ/MM/AAAA.
 
     expected_output: >
-        Un objet JSON valide avec la structure suivante :
+        Un objet JSON (Python dict) avec la structure suivante :
         {
           "numero_devis": "DEV-XXXX",
           "date_emission": "JJ/MM/AAAA",
@@ -57,6 +61,29 @@ extract_devis_data:
           "fichier_source": "nom_du_fichier.pdf"
         }
 
-        Le JSON doit être retourné uniquement, sans texte supplémentaire avant ou après.
+        IMPORTANT : 
+        - Vous devez retourner l'objet JSON complet dans votre réponse finale.
+        - Ne créez PAS de fichier, juste retournez les données structurées.
+        - Les données seront sauvegardées dans une tâche suivante.
+
+    agent: devis_extractor
+
+write_json_file:
+    description: >
+        Sauvegardez l'objet JSON fourni dans un fichier JSON. 
+        Vous recevrez les données extraites de la tâche précédente sous forme d'objet JSON.
+
+        PROCÉDURE :
+        1. Prendre l'objet JSON fourni (résultat de la tâche précédente).
+        2. Utiliser l'outil 'json_file_writer' pour sauvegarder le fichier JSON.
+
+    expected_output: >
+        Un message de confirmation indiquant que le fichier JSON a été créé avec succès.
+
+        IMPORTANT : 
+        - Vous DEVEZ utiliser l'outil json_file_writer pour créer le fichier JSON.
+        - Une fois que json_file_writer a retourné "Fichier JSON créé avec succès", 
+          la tâche est terminée. Vous n'avez PAS besoin de vérifier ou de relire le fichier.
+        - Ne pas utiliser d'autres outils après avoir créé le fichier avec succès.
 
     agent: devis_extractor
