@@ -1,7 +1,9 @@
-crewai==0.30.11
-crewai-tools==0.2.6
-langchain-community==0.0.38
-pydantic==2.7.1
-pdfplumber==0.11.0
-pyyaml==6.0.1
-python-dotenv==1.0.1
+crewai[tools]>=0.70.0
+litellm
+fastapi
+apscheduler
+email-validator
+fastapi-sso
+pdfplumber
+python-dotenv
+pyyaml

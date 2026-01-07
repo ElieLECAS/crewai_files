@@ -32,8 +32,8 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - PYTHONPATH=/app
       - OTEL_SDK_DISABLED=true
-    env_file:
-      - .env
+      - MODEL=${MODEL:-mistral:7b}
+
     command: python src/main.py
     # Limites de ressources pour optimisation
     deploy:
