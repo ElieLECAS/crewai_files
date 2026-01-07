@@ -1,0 +1,14 @@
+extraction_task:
+  description: >
+    TU DOIS :
+    1. Appeler l'outil 'extract_pdf_content' pour le fichier {pdf_path}.
+    2. Lire le texte retourné par l'outil.
+    3. Extraire les données RÉELLES (Numéro, Dates, Entreprise, Prestations, Totaux).
+    
+    INTERDICTION :
+    - Ne pas inventer de données.
+    - Si l'outil ne retourne rien, le champ 'numero_devis' doit être 'VIDE'.
+    - Ne jamais utiliser '12345' ou 'Société XYZ' si ce n'est pas écrit dans le texte.
+  expected_output: >
+    Objet Pydantic DevisSortie rempli uniquement avec les infos du document.
+  agent: pdf_analyst

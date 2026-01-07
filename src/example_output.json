@@ -1,0 +1,34 @@
+{
+  "numero_devis": "DEV-0001",
+  "date_emission": "15/01/2024",
+  "date_validite": "15/02/2024",
+  "entreprise": {
+    "nom": "TechSolutions Pro",
+    "adresse": "123 Rue de la Tech, 75001 Paris"
+  },
+  "prestations": [
+    {
+      "description": "Développement application web",
+      "quantite": 3,
+      "prix_unitaire": 2500,
+      "montant_ht": 7500
+    },
+    {
+      "description": "Création site e-commerce",
+      "quantite": 1,
+      "prix_unitaire": 4500,
+      "montant_ht": 4500
+    }
+  ],
+  "totaux": {
+    "total_ht": 12000,
+    "tva": 2400,
+    "total_ttc": 14400
+  },
+  "conditions_paiement": {
+    "delai": "30 jours",
+    "mode": "Virement bancaire"
+  },
+  "fichier_source": "devis_001_TechSolutions_Pro.pdf"
+}
+
