@@ -38,7 +38,9 @@ def main():
     native_llm = LLM(
         model=f"ollama/{MODEL}",
         base_url=OLLAMA_BASE_URL,
-        timeout=TIMEOUT
+        timeout=TIMEOUT,
+        temperature=0.1,  # Température basse pour des réponses stables et déterministes
+        max_tokens=4000   # Contexte suffisant pour garantir la complétude des réponses
     )
 
     # 3. Initialisation des outils
@@ -57,8 +59,11 @@ def main():
         backstory=agent_config.get('backstory'),
         llm=native_llm,
         tools=[read_pdf_file, json_file_writer], 
-        verbose=True, 
-        allow_delegation=False
+        verbose=agent_config.get('verbose', True), 
+        allow_delegation=agent_config.get('allow_delegation', False),
+        max_iter=agent_config.get('max_iter', 5),
+        max_execution_time=agent_config.get('max_execution_time', 300),
+        memory=agent_config.get('memory', False)
     )
 
     # 6. Traitement des fichiers PDF

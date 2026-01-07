@@ -21,11 +21,13 @@ class JsonFileWriterInput(BaseModel):
 class JsonFileWriterTool(BaseTool):
     name: str = "json_file_writer"
     description: str = (
+        "⚠️ CET OUTIL EST CRITIQUE. Vous ne devez JAMAIS terminer votre travail sans avoir appelé cet outil avec les données extraites. ⚠️\n\n"
         "Outil OBLIGATOIRE pour sauvegarder les données extraites dans un fichier JSON. "
-        "Vous DEVEZ utiliser cet outil pour créer le fichier de sortie. "
+        "Vous DEVEZ ABSOLUMENT utiliser cet outil pour créer le fichier de sortie. "
+        "Sans cet appel, votre travail sera considéré comme incomplet et échouera.\n\n"
         "Accepte un objet JSON (dict/list) ou une chaîne JSON. "
         "Si un objet Python (dict/list) est fourni, il sera automatiquement converti en chaîne JSON formatée. "
-        "Utilisez cet outil après avoir extrait les données du PDF pour sauvegarder le résultat. "
+        "Utilisez cet outil après avoir extrait les données du PDF pour sauvegarder le résultat.\n\n"
         "Exemple: filename='devis_001.json', content={'numero_devis': 'DEV-0001', ...}, directory='./'"
     )
     args_schema: Type[BaseModel] = JsonFileWriterInput
