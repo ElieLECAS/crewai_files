@@ -2,7 +2,7 @@
 .env
 
 # Directories
-input/
+# input/
 output/
 __pycache__/
 *.pyc
