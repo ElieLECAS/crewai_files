@@ -2,16 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Installation des dépendances système
+# Installation minimale des dépendances système
+# poppler-utils pour pdf2image (conversion PDF -> images)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# IMPORTANT : Copier les dossiers src ET config
+# Copier tous les fichiers du projet
 COPY . .
 
 # Création des dossiers pour les volumes

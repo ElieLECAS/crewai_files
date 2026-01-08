@@ -6,44 +6,40 @@ services:
     container_name: ollama_server
     volumes:
       - ollama_data:/root/.ollama
-    privileged: true
-    devices:
-      - /dev/kfd:/dev/kfd
-      - /dev/dri:/dev/dri
+    # Mode CPU uniquement (sans GPU NVIDIA pour installation légère)
     deploy:
       resources:
         limits:
-          memory: 8G    # Prévoyez large pour Mistral 7B (Modèle + Contexte)
-          cpus: "4.0"   # Donnez plus de puissance pour le calcul des tokens
+          memory: 8G # Prévoyez large pour Mistral 7B (Modèle + Contexte)
+          cpus: "4.0" # Donnez plus de puissance pour le calcul des tokens
         reservations:
           memory: 4G
 
-  crewai:
+  pdf_processor:
     build: .
-    container_name: crewai_pdf_processor
+    container_name: pdf_processor
     depends_on:
       - ollama
     volumes:
       - ./input:/app/input
       - ./output:/app/output
       - ./src:/app/src
-      - ./config:/app/config
     environment:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - PYTHONPATH=/app
-      - OTEL_SDK_DISABLED=true
       - MODEL=${MODEL:-mistral:7b}
+      - TIMEOUT=${TIMEOUT:-600}
 
     command: python src/main.py
     # Limites de ressources pour optimisation
     deploy:
       resources:
         limits:
-          memory: 6G
+          memory: 4G
           cpus: "2"
         reservations:
-          memory: 2G
-          cpus: "1"
+          memory: 1G
+          cpus: "0.5"
 
 volumes:
   ollama_data:

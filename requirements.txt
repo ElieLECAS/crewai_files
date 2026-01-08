@@ -1,10 +1,8 @@
-crewai[tools]>=0.70.0
 langchain
-litellm
-fastapi
-apscheduler
-email-validator
-fastapi-sso
-pdfplumber
+langchain-community
+langchain-ollama
+pydantic>=2.0.0
 python-dotenv
-pyyaml
+pdfplumber
+pdf2image
+pillow
