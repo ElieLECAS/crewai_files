@@ -14,7 +14,7 @@ services:
       resources:
         limits:
           memory: 8G    # Prévoyez large pour Mistral 7B (Modèle + Contexte)
-          cpus: "2.0"   # Donnez plus de puissance pour le calcul des tokens
+          cpus: "4.0"   # Donnez plus de puissance pour le calcul des tokens
         reservations:
           memory: 4G
 

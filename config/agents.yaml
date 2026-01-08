@@ -22,5 +22,5 @@ devis_extractor:
     verbose: true
     allow_delegation: false
     max_iter: 1
-    max_execution_time: 300
+    max_execution_time: 600
     memory: false
