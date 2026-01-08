@@ -21,6 +21,6 @@ devis_extractor:
 
     verbose: true
     allow_delegation: false
-    max_iter: 2 # Force l'agent à persévérer jusqu'à 5 itérations
-    max_execution_time: 300 # 5 minutes maximum pour éviter les blocages
-    memory: false # Désactive la mémoire pour éviter la confusion entre fichiers PDF
+    max_iter: 1
+    max_execution_time: 300
+    memory: false
