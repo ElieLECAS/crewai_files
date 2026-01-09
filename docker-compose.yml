@@ -29,6 +29,8 @@ services:
       - PYTHONPATH=/app
       - MODEL=${MODEL:-mistral:7b}
       - TIMEOUT=${TIMEOUT:-600}
+      - MAX_WORKERS=${MAX_WORKERS:-3}
+      - POLL_INTERVAL=${POLL_INTERVAL:-10}
 
     command: python src/main.py
     # Limites de ressources pour optimisation

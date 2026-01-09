@@ -10,13 +10,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     libmagic1 \
-    libgl1 \
-    libglib2.0-0 \
+    tesseract-ocr \
+    tesseract-ocr-fra \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-# Installation de PyTorch CPU avant Docling pour éviter la version GPU (CUDA) volumineuse
-RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copier tous les fichiers du projet

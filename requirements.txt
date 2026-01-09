@@ -4,5 +4,8 @@ langchain-ollama
 pydantic>=2.0.0
 python-dotenv
 langgraph
-docling
+pdf2image
+pytesseract
+PyPDF2
 pillow
+watchdog

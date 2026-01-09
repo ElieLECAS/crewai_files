@@ -6,12 +6,18 @@ import logging
 import threading
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import TypedDict, List, Optional, Annotated, Literal
+from typing import TypedDict, List, Optional, Annotated, Literal, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
-from docling.document_converter import DocumentConverter
+import PyPDF2
+from pdf2image import convert_from_path
+import pytesseract
+from PIL import Image
+from watchdog.observers.polling import PollingObserver as Observer
+from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 # Configuration du logging avec timestamps
 logging.basicConfig(
@@ -27,7 +33,8 @@ load_dotenv()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 MODEL = os.getenv("MODEL", "mistral:3b")
 TIMEOUT = int(os.getenv("TIMEOUT", "600"))
-DOCLING_TIMEOUT = int(os.getenv("DOCLING_TIMEOUT", "300"))  # 5 minutes max pour le partitionnement
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Nombre de fichiers à traiter en parallèle
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # Intervalle de polling en secondes (pour volumes Docker/Windows)
 
 # Chemins des volumes Docker
 INPUT_DIR = "/app/input"
@@ -41,7 +48,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ============================================================================
 
 class LineItem(BaseModel):
-    """Ligne d'article pour facture ou devis."""
+    """Ligne d'article générique."""
     reference: Optional[str] = Field(None, description="Référence ou numéro de commande")
     designation: str = Field(..., description="Description complète de l'article")
     quantite: Optional[float] = Field(None, description="Quantité commandée")
@@ -60,8 +67,39 @@ class InvoiceHeader(BaseModel):
     total_ttc: Optional[float] = Field(None, description="Montant total TTC")
 
 
+# --- VITRAGLASS ---
+class VitraglassLineItem(LineItem):
+    """Ligne de facture spécifique à Vitraglass."""
+    numero_commande: Optional[str] = Field(None, description="Numéro de commande Vitraglass")
+    bon_livraison: Optional[str] = Field(None, description="Numéro du bon de livraison associé")
+    reference_commande: Optional[str] = Field(None, description="Référence interne de la commande")
+    hauteur_largeur: Optional[str] = Field(None, description="Dimensions Hauteur x Largeur")
+    intercalaire: Optional[str] = Field(None, description="Type d'intercalaire (ex: 10TGNO)")
+    surface: Optional[float] = Field(None, description="Surface unitaire")
+    surface_totale: Optional[float] = Field(None, description="Surface totale pour la ligne")
+
+class VitraglassInvoiceSchema(BaseModel):
+    """Schéma spécifique pour les factures Vitraglass."""
+    entete: InvoiceHeader = Field(..., description="En-tête de la facture")
+    lignes: List[VitraglassLineItem] = Field(default_factory=list, description="Lignes de facturation détaillées")
+    fichier_source: Optional[str] = Field(None, description="Nom du fichier source")
+
+
+# --- PROFERM / SOPROFEN (format avec références SOI) ---
+class ProfermLineItem(LineItem):
+    """Ligne de facture spécifique à Proferm/Soprofen (format avec références SOI)."""
+    reference_soi: Optional[str] = Field(None, description="Référence SOI complète")
+    dimensions: Optional[str] = Field(None, description="Dimensions extraites de la désignation")
+
+class ProfermInvoiceSchema(BaseModel):
+    """Schéma spécifique pour les factures Proferm/Soprofen."""
+    entete: InvoiceHeader = Field(..., description="En-tête de la facture")
+    lignes: List[ProfermLineItem] = Field(default_factory=list, description="Lignes de facturation")
+    fichier_source: Optional[str] = Field(None, description="Nom du fichier source")
+
+
 class InvoiceSchema(BaseModel):
-    """Schéma complet pour une facture."""
+    """Schéma complet pour une facture générique."""
     entete: InvoiceHeader = Field(..., description="Informations d'en-tête de la facture")
     lignes: List[LineItem] = Field(default_factory=list, description="Liste des lignes de facturation")
     fichier_source: Optional[str] = Field(None, description="Nom du fichier PDF source")
@@ -76,6 +114,14 @@ class QuoteHeader(BaseModel):
     client_nom: Optional[str] = Field(None, description="Nom du client destinataire")
 
 
+class QuoteLineItem(LineItem):
+    """Ligne de prestation spécifique pour devis."""
+    dimensions: Optional[str] = Field(None, description="Dimensions (ex: 1400 x 2150 mm)")
+    couleur_exterieure: Optional[str] = Field(None, description="Couleur extérieure (ex: Gris 7035)")
+    couleur_interieure: Optional[str] = Field(None, description="Couleur intérieure")
+    caracteristiques_techniques: List[str] = Field(default_factory=list, description="Liste des caractéristiques techniques (ex: Seuil 18mm, Serrure...)")
+
+
 class QuoteTotals(BaseModel):
     """Totaux financiers d'un devis."""
     total_ht: Optional[float] = Field(None, description="Total Hors Taxes")
@@ -86,7 +132,7 @@ class QuoteTotals(BaseModel):
 class QuoteSchema(BaseModel):
     """Schéma complet pour un devis."""
     entete: QuoteHeader = Field(..., description="Informations d'en-tête du devis")
-    prestations: List[LineItem] = Field(default_factory=list, description="Liste des prestations ou services")
+    prestations: List[QuoteLineItem] = Field(default_factory=list, description="Liste des prestations ou services")
     totaux: QuoteTotals = Field(..., description="Totaux financiers du devis")
     conditions_paiement: Optional[str] = Field(None, description="Conditions et délais de paiement")
     fichier_source: Optional[str] = Field(None, description="Nom du fichier PDF source")
@@ -102,6 +148,7 @@ class AgentState(TypedDict):
     file_name: str
     doc_markdown: Optional[str]
     doc_type: Optional[str]  # "devis" ou "facture"
+    supplier: Optional[str]   # "vitraglass", "proferm", etc.
     structured_data: Optional[dict]
     is_valid: bool
     retry_count: int
@@ -112,54 +159,233 @@ class AgentState(TypedDict):
 # EXEMPLES FEW-SHOT POUR STABILISER LE MODÈLE
 # ============================================================================
 
-INVOICE_EXAMPLE = """{
+INVOICE_EXAMPLE_VITRAGLASS = """{
   "entete": {
-    "numero_facture": "FAC2025-001",
-    "date": "2025-01-09",
-    "client_nom": "Client Exemple SAS",
-    "total_ttc": 1200.50
+    "numero_facture": "2025 - 37655",
+    "date": "2025-10-31",
+    "client_nom": "PROFERM ALU",
+    "total_ttc": 1206.50
   },
   "lignes": [
     {
-      "reference": "REF001",
-      "designation": "Prestation de conseil informatique",
-      "quantite": 5.0,
-      "unite": "Heures",
-      "prix_unitaire_brut": 100.0,
-      "remise_pourcentage": 10.0,
-      "total_ht": 450.0,
+      "numero_commande": "2025 044432",
+      "bon_livraison": "2025 67804",
+      "reference_commande": "2503133.NJ0",
+      "designation": "D.V. : F 44/2 clair + Low-e 1.0 Advanced 6 mm(#3) +Gaz Argon",
+      "hauteur_largeur": "2065 x 1727",
+      "intercalaire": "10TGNO",
+      "surface": 3.58,
+      "surface_totale": 3.58,
+      "quantite": 1.0,
+      "prix_unitaire_brut": 505.96,
+      "total_ht": 505.96,
+      "tva_pourcentage": 20.0
+    },
+    {
+      "numero_commande": "2025 582010",
+      "bon_livraison": "2025 67804",
+      "reference_commande": "49181/CDE 2510513.Y01/00175 SECHER D19777/POS201",
+      "designation": "D.V. : Glace claire 6 mm + Low-e 4 mm(#3) +Gaz Argon",
+      "hauteur_largeur": "1922 x 939",
+      "intercalaire": "14TGNO",
+      "surface": 0.87,
+      "surface_totale": 0.87,
+      "quantite": 1.0,
+      "prix_unitaire_brut": 25.96,
+      "total_ht": 25.96,
       "tva_pourcentage": 20.0
     }
   ],
-  "fichier_source": "exemple.pdf"
+  "fichier_source": "FACPDF_2025_37655.pdf"
 }"""
 
-QUOTE_EXAMPLE = """{
+INVOICE_EXAMPLE_PROFERM = """{
   "entete": {
-    "numero_devis": "DEV2025-001",
-    "date_emission": "2025-01-09",
-    "date_validite": "2025-02-09",
-    "entreprise_nom": "TechSolutions Pro",
-    "client_nom": "Client Exemple SAS"
+    "numero_facture": "W0828058",
+    "date": "2025-10-03",
+    "client_nom": "PROFERM MULTITECHNIQUES",
+    "total_ttc": 854.70
+  },
+  "lignes": [
+    {
+      "reference_soi": "SOI C 25 209 007 195",
+      "designation": "Ligne 1 Chrono One motorisé gamme Neuf",
+      "dimensions": "1474 * 2238 mm",
+      "quantite": 1.0,
+      "unite": "PIECE",
+      "prix_unitaire_brut": 712.25,
+      "total_ht": 712.25,
+      "tva_pourcentage": 20.0
+    }
+  ],
+  "fichier_source": "W0828058_Demat.pdf"
+}"""
+
+QUOTE_EXAMPLE_OPTIMIZED = """{
+  "entete": {
+    "numero_devis": "D47025",
+    "date_emission": "2025-10-24",
+    "date_validite": "2025-11-07",
+    "entreprise_nom": "PROFERM MULTITECHNIQUES",
+    "client_nom": "Société LE LOFT"
   },
   "prestations": [
     {
-      "designation": "Développement application web",
-      "quantite": 10.0,
-      "unite": "Jours",
-      "prix_unitaire_brut": 500.0,
-      "total_ht": 5000.0,
+      "designation": "Porte d'entrée vitrée 2 vantaux tiercés",
+      "dimensions": "Larg 1400 mm x Haut 2150 mm",
+      "couleur_exterieure": "Gris 7035 Granité",
+      "couleur_interieure": "Gris 7035 Granité",
+      "caracteristiques_techniques": [
+        "Pose en applique intérieure",
+        "Dormant ep.55mm",
+        "Seuil 18 mm",
+        "Vitrage sécurité 44.2/12/4 faible émissif argon",
+        "Ferme-porte"
+      ],
+      "quantite": 1.0,
+      "unite": "Unité",
+      "prix_unitaire_brut": 3583.6,
+      "total_ht": 3583.6,
       "tva_pourcentage": 20.0
     }
   ],
   "totaux": {
-    "total_ht": 5000.0,
-    "total_tva": 1000.0,
-    "total_ttc": 6000.0
+    "total_ht": 7915.62,
+    "total_tva": 1583.12,
+    "total_ttc": 9498.74
   },
-  "conditions_paiement": "Paiement à 30 jours",
-  "fichier_source": "exemple.pdf"
+  "conditions_paiement": "selon ouverture de compte",
+  "fichier_source": "Devis D47025 - PE.pdf"
 }"""
+
+
+# ============================================================================
+# OUTILS PDF (EXTRACTEUR DE TEXTE + OCR)
+# ============================================================================
+
+def extract_text_native(pdf_path: str) -> List[Tuple[int, str]]:
+    """
+    Extrait le texte natif du PDF page par page.
+    Retourne une liste de tuples (numéro_page, texte).
+    """
+    pages_content = []
+    try:
+        with open(pdf_path, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                pages_content.append((i + 1, text))
+    except Exception as e:
+        logger.error(f"Erreur lors de l'extraction native du PDF : {str(e)}")
+    return pages_content
+
+def is_page_text_empty(text: str, threshold: int = 20) -> bool:
+    """
+    Détermine si une page est considérée comme vide ou scannée
+    basé sur le nombre de caractères extraits.
+    """
+    clean_text = text.strip()
+    return len(clean_text) < threshold
+
+def ocr_page(pdf_path: str, page_num: int) -> str:
+    """
+    Convertit une page spécifique du PDF en image et effectue un OCR.
+    """
+    try:
+        # pdf2image utilise l'indexation 0, donc page_num - 1
+        images = convert_from_path(
+            pdf_path, 
+            first_page=page_num, 
+            last_page=page_num,
+            fmt="jpeg"
+        )
+        if not images:
+            return ""
+        
+        # OCR avec pytesseract (en français)
+        text = pytesseract.image_to_string(images[0], lang='fra')
+        return text
+    except Exception as e:
+        logger.error(f"Erreur lors de l'OCR de la page {page_num} : {str(e)}")
+        return ""
+
+# ============================================================================
+# FONCTIONS UTILITAIRES DE NORMALISATION
+# ============================================================================
+
+def normalize_vitraglass_line(line: dict) -> List[dict]:
+    """
+    Normalise une ligne Vitraglass : si des champs sont des listes, crée plusieurs lignes.
+    Retourne une liste de lignes normalisées avec une ligne par pièce.
+    """
+    # Vérifier si des champs critiques sont des listes
+    list_fields = ['hauteur_largeur', 'intercalaire', 'surface', 'prix_unitaire_brut']
+    has_lists = any(isinstance(line.get(field), list) for field in list_fields)
+    
+    if not has_lists:
+        return [line]
+    
+    # Trouver la longueur maximale des listes (nombre de pièces différentes)
+    max_len = 1
+    for field in list_fields:
+        value = line.get(field)
+        if isinstance(value, list):
+            max_len = max(max_len, len(value))
+    
+    # Créer une ligne séparée par pièce
+    normalized_lines = []
+    original_qty = line.get('quantite', 1.0)
+    original_total_ht = line.get('total_ht', 0.0)
+    
+    for i in range(max_len):
+        new_line = line.copy()
+        
+        # Extraire les valeurs des listes, ou utiliser la valeur simple
+        for field in list_fields:
+            value = line.get(field)
+            if isinstance(value, list):
+                new_line[field] = value[i] if i < len(value) else (value[0] if value else None)
+            else:
+                new_line[field] = value
+        
+        # Ajuster quantité : 1 pièce par ligne
+        new_line['quantite'] = 1.0
+        
+        # Recalculer total_ht basé sur prix_unitaire_brut et quantité
+        if new_line.get('prix_unitaire_brut') and isinstance(new_line['prix_unitaire_brut'], (int, float)):
+            new_line['total_ht'] = new_line['prix_unitaire_brut'] * new_line['quantite']
+        else:
+            # Si on ne peut pas calculer, diviser le total HT par le nombre de pièces
+            if isinstance(original_total_ht, (int, float)) and original_total_ht > 0:
+                new_line['total_ht'] = original_total_ht / max_len
+        
+        # Ajuster surface_totale si nécessaire
+        if new_line.get('surface') and isinstance(new_line['surface'], (int, float)):
+            new_line['surface_totale'] = new_line['surface'] * new_line['quantite']
+        
+        normalized_lines.append(new_line)
+    
+    return normalized_lines if normalized_lines else [line]
+
+
+def normalize_extracted_data(structured_data: dict, supplier: str) -> dict:
+    """
+    Normalise les données extraites pour corriger les erreurs de format (listes au lieu de valeurs simples).
+    """
+    if supplier != "vitraglass" or not structured_data:
+        return structured_data
+    
+    lines = structured_data.get("lignes", [])
+    if not lines:
+        return structured_data
+    
+    normalized_lines = []
+    for line in lines:
+        normalized = normalize_vitraglass_line(line)
+        normalized_lines.extend(normalized)
+    
+    structured_data["lignes"] = normalized_lines
+    return structured_data
 
 
 # ============================================================================
@@ -168,60 +394,37 @@ QUOTE_EXAMPLE = """{
 
 def partition_node(state: AgentState) -> AgentState:
     """
-    Nœud 1 : Partitionne le PDF avec Docling.
-    Extrait le contenu structuré en Markdown.
+    Nœud 1 : Partitionne le PDF de manière hybride.
+    1. Extrait le texte natif.
+    2. Si une page est vide/scannée, utilise l'OCR (pdf2image + pytesseract).
     """
     try:
         file_path = state["file_path"]
         file_name = state["file_name"]
         
-        logger.info(f"📄 Partitionnement du document avec Docling : {file_name}")
+        logger.info(f"📄 Analyse hybride du document : {file_name}")
         start_time = datetime.now()
         
-        # Initialiser le convertisseur Docling (configuration par défaut)
-        # Note: Docling détecte automatiquement si OCR est nécessaire
-        converter = DocumentConverter()
+        # 1. Extraction native
+        native_pages = extract_text_native(file_path)
+        full_content = []
         
-        logger.info(f"   Timeout max : {DOCLING_TIMEOUT}s")
+        for page_num, text in native_pages:
+            if is_page_text_empty(text):
+                logger.info(f"   Page {page_num} : Pas de texte détecté, passage à l'OCR...")
+                ocr_text = ocr_page(file_path, page_num)
+                full_content.append(f"## Page {page_num} (OCR)\n\n{ocr_text}")
+            else:
+                logger.info(f"   Page {page_num} : Texte natif extrait")
+                full_content.append(f"## Page {page_num}\n\n{text}")
         
-        # Convertir le document avec gestion de timeout via threading
-        result = None
-        conversion_error = None
-        
-        def convert_document():
-            nonlocal result, conversion_error
-            try:
-                result = converter.convert(file_path)
-            except Exception as e:
-                conversion_error = e
-        
-        # Lancer la conversion dans un thread
-        thread = threading.Thread(target=convert_document)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout=DOCLING_TIMEOUT)
-        
-        # Vérifier si le thread est encore actif (timeout)
-        if thread.is_alive():
-            logger.error(f"❌ Partitionnement timeout après {DOCLING_TIMEOUT}s")
-            return {
-                **state,
-                "doc_markdown": None,
-                "error_message": f"Partitionnement timeout après {DOCLING_TIMEOUT}s"
-            }
-        
-        # Vérifier s'il y a eu une erreur
-        if conversion_error:
-            raise conversion_error
-        
-        if result is None:
-            raise Exception("Conversion retournée None")
-        
-        # Exporter en Markdown
-        doc_markdown = result.document.export_to_markdown()
+        doc_markdown = "\n\n".join(full_content)
         
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"✅ Document converti en Markdown ({len(doc_markdown)} caractères) en {elapsed:.2f}s")
+        logger.info(f"✅ Document analysé ({len(doc_markdown)} caractères) en {elapsed:.2f}s")
+        
+        if not doc_markdown.strip():
+            raise Exception("Le document semble vide après analyse native et OCR")
         
         return {
             **state,
@@ -230,13 +433,11 @@ def partition_node(state: AgentState) -> AgentState:
         }
     
     except Exception as e:
-        logger.error(f"❌ Erreur lors du partitionnement avec Docling : {str(e)}")
-        import traceback
-        logger.debug(traceback.format_exc())
+        logger.error(f"❌ Erreur lors de l'analyse hybride : {str(e)}")
         return {
             **state,
             "doc_markdown": None,
-            "error_message": f"Partitionnement échoué : {str(e)}"
+            "error_message": f"Analyse échouée : {str(e)}"
         }
 
 
@@ -295,23 +496,118 @@ RÉPONSE (un seul mot) :"""
         return {**state, "doc_type": "devis"}
 
 
-def extract_node(state: AgentState) -> AgentState:
+def detect_supplier_node(state: AgentState) -> AgentState:
     """
-    Nœud 3 : Extrait les données structurées via Pydantic et Few-Shot.
+    Nœud 2.5 : Détecte le fournisseur émetteur de la facture.
+    IMPORTANT : PROFERM/SOPROFEN est notre entreprise (le client), pas un fournisseur.
     """
     try:
         doc_markdown = state["doc_markdown"]
         doc_type = state["doc_type"]
+        
+        if doc_type != "facture" or not doc_markdown:
+            return {**state, "supplier": "inconnu"}
+        
+        logger.info("🔍 Détection du fournisseur émetteur...")
+        
+        # Vérification par règles avant d'utiliser le LLM pour plus de précision
+        markdown_upper = doc_markdown.upper()
+        
+        # Détection VITRAGLASS : chercher dans l'en-tête (premières lignes)
+        if any(keyword in markdown_upper[:2000] for keyword in ["VITRAGLASS", "GROUPE DEVGLASS", "CEKAL", "GLASS A LIA", "FABRICANT DE VITRAGE ISOLANT"]):
+            logger.info("✅ Fournisseur détecté : vitraglass (par règles)")
+            return {**state, "supplier": "vitraglass"}
+        
+        # Détection SOPROFEN : chercher si SOPROFEN est l'émetteur (pas le client)
+        if "SOPROFEN" in markdown_upper[:2000]:
+            # Vérifier que SOPROFEN n'est pas juste le client
+            # Si SOPROFEN apparaît dans l'en-tête avec adresse, c'est l'émetteur
+            prompt = f"""Tu es un expert en analyse de factures françaises.
+Analyse ce document et détermine si SOPROFEN est l'ÉMETTEUR (fournisseur) ou le CLIENT de cette facture.
+
+IMPORTANT : 
+- Si SOPROFEN est dans l'en-tête avec son adresse/coordonnées -> c'est l'émetteur (fournisseur)
+- Si SOPROFEN est mentionné comme "client" ou "destinataire" -> ce n'est PAS le fournisseur
+
+CONTENU (premières lignes) :
+{doc_markdown[:2000]}
+
+QUESTION : SOPROFEN est-il l'ÉMETTEUR (fournisseur) de cette facture ?
+RÉPONSE (un seul mot : oui ou non) :"""
+
+            llm = ChatOllama(
+                model=MODEL,
+                base_url=OLLAMA_BASE_URL,
+                timeout=TIMEOUT,
+                temperature=0
+            )
+            
+            response = llm.invoke([HumanMessage(content=prompt)])
+            is_supplier = "oui" in response.content.strip().lower()
+            
+            if is_supplier:
+                logger.info("✅ Fournisseur détecté : soprofen")
+                return {**state, "supplier": "soprofen"}
+        
+        # Détection par LLM pour autres cas
+        prompt = f"""Tu es un expert en analyse de factures françaises.
+Identifie le FOURNISSEUR ÉMETTEUR de cette facture (celui qui émet la facture, pas le client).
+
+IMPORTANT :
+- PROFERM, PROFERM ALU, PROFERM MULTITECHNIQUES = CLIENT (notre entreprise), PAS un fournisseur
+- VITRAGLASS, GROUPE DEVGLASS, CEKAL, GLASS A LIA = fournisseur VITRAGLASS
+- SOPROFEN = fournisseur uniquement s'il est dans l'en-tête avec adresse
+- Cherche l'entreprise dans l'en-tête (nom, adresse, SIRET)
+
+CONTENU :
+{doc_markdown[:3000]}
+
+RÉPONSE (un seul mot parmi : vitraglass, soprofen, inconnu) :"""
+
+        llm = ChatOllama(
+            model=MODEL,
+            base_url=OLLAMA_BASE_URL,
+            timeout=TIMEOUT,
+            temperature=0
+        )
+        
+        response = llm.invoke([HumanMessage(content=prompt)])
+        supplier = response.content.strip().lower()
+        
+        if "vitraglass" in supplier:
+            supplier = "vitraglass"
+        elif "soprofen" in supplier:
+            supplier = "soprofen"
+        else:
+            supplier = "inconnu"
+            
+        logger.info(f"✅ Fournisseur détecté : {supplier}")
+        return {**state, "supplier": supplier}
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la détection du fournisseur : {str(e)}")
+        return {**state, "supplier": "inconnu"}
+
+
+def extract_node(state: AgentState) -> AgentState:
+    """
+    Nœud 3 : Extrait les données structurées via Pydantic et Few-Shot.
+    Sélectionne le schéma optimisé selon le type et le fournisseur.
+    """
+    try:
+        doc_markdown = state["doc_markdown"]
+        doc_type = state["doc_type"]
+        supplier = state.get("supplier", "inconnu")
         file_name = state["file_name"]
         
-        logger.info(f"🤖 Extraction des données avec Docling (type: {doc_type})")
+        logger.info(f"🤖 Extraction des données structurées (type: {doc_type}, fournisseur: {supplier})")
         
         if not doc_markdown:
             logger.error("❌ Pas de contenu Markdown disponible pour l'extraction")
             return {
                 **state,
                 "structured_data": None,
-                "error_message": "Partitionnement échoué : pas de contenu Markdown disponible",
+                "error_message": "Analyse échouée : pas de contenu Markdown disponible",
                 "retry_count": state.get("retry_count", 0) + 1
             }
         
@@ -324,38 +620,58 @@ def extract_node(state: AgentState) -> AgentState:
             temperature=0
         )
         
-        # Sélectionner le schéma et l'exemple approprié
+        # Sélection du schéma et de l'exemple selon doc_type et supplier
         if doc_type == "facture":
-            schema_class = InvoiceSchema
-            example = INVOICE_EXAMPLE
-            prompt = f"""Tu es un expert en extraction de factures PDF.
+            if supplier == "vitraglass":
+                schema_class = VitraglassInvoiceSchema
+                example = INVOICE_EXAMPLE_VITRAGLASS
+                instr_supp = """- Extrais les numéros de commande, bons de livraison et dimensions (Hauteur x Largeur).
+- CRITIQUE : Si une commande a plusieurs pièces avec des dimensions différentes, crée UNE LIGNE SÉPARÉE par pièce.
+- Chaque ligne doit avoir des valeurs SIMPLES (pas de listes) : hauteur_largeur = "2065 x 1727" (string), pas ["2065 x 1727", "1922 x 939"].
+- Si plusieurs pièces identiques, utilise la quantité (quantite: 2.0) mais garde une seule ligne avec les mêmes dimensions."""
+            elif supplier == "soprofen":
+                # SOPROFEN utilise un format similaire à PROFERM avec références SOI
+                schema_class = ProfermInvoiceSchema
+                example = INVOICE_EXAMPLE_PROFERM
+                instr_supp = "- Extrais les références SOI et les dimensions de chaque produit."
+            else:
+                # Schéma par défaut pour fournisseurs inconnus
+                schema_class = ProfermInvoiceSchema
+                example = INVOICE_EXAMPLE_PROFERM
+                instr_supp = "- Utilise le schéma standard d'extraction de facture."
+
+            prompt = f"""Tu es un expert en extraction de factures PDF {supplier.upper()}.
 
 EXEMPLE DE SORTIE ATTENDUE :
 {example}
 
 CONTENU DU DOCUMENT (MARKDOWN) :
-{doc_markdown[:4000]}
+{doc_markdown[:8000]}
 
-INSTRUCTIONS :
+INSTRUCTIONS STRICTES :
 - Extrais toutes les lignes du tableau de facturation présent dans le Markdown
-- Utilise le schéma JSON de l'exemple ci-dessus
+{instr_supp}
+- RÈGLE ABSOLUE : Chaque ligne doit avoir des valeurs SIMPLES (string ou nombre), JAMAIS de listes/tableaux.
+- Si tu vois plusieurs pièces avec des dimensions différentes dans le tableau, crée UNE LIGNE SÉPARÉE par pièce.
+- Chaque ligne doit représenter UNE SEULE pièce avec ses dimensions spécifiques.
 - Le fichier source est : {file_name}
 
-Retourne UNIQUEMENT le JSON sans commentaires."""
-        else:
+Retourne UNIQUEMENT le JSON valide sans commentaires."""
+
+        else:  # devis
             schema_class = QuoteSchema
-            example = QUOTE_EXAMPLE
-            prompt = f"""Tu es un expert en extraction de devis PDF.
+            example = QUOTE_EXAMPLE_OPTIMIZED
+            prompt = f"""Tu es un expert en extraction de devis PDF PROFERM.
 
 EXEMPLE DE SORTIE ATTENDUE :
 {example}
 
 CONTENU DU DOCUMENT (MARKDOWN) :
-{doc_markdown[:4000]}
+{doc_markdown[:8000]}
 
 INSTRUCTIONS :
-- Extrais toutes les prestations/services du devis présent dans le Markdown
-- Utilise le schéma JSON de l'exemple ci-dessus
+- Extrais toutes les prestations/services du devis
+- Détaille les dimensions, couleurs (ext/int) et caractéristiques techniques (sous forme de liste)
 - Calcule les totaux HT, TVA et TTC
 - Le fichier source est : {file_name}
 
@@ -365,20 +681,78 @@ Retourne UNIQUEMENT le JSON sans commentaires."""
         structured_llm = llm.with_structured_output(schema_class)
         
         start_time = datetime.now()
-        result = structured_llm.invoke([HumanMessage(content=prompt)])
-        elapsed = (datetime.now() - start_time).total_seconds()
         
-        logger.info(f"✅ Extraction terminée en {elapsed:.2f}s")
+        try:
+            result = structured_llm.invoke([HumanMessage(content=prompt)])
+            elapsed = (datetime.now() - start_time).total_seconds()
+            
+            logger.info(f"✅ Extraction terminée en {elapsed:.2f}s")
+            
+            # Convertir en dict pour l'état
+            structured_data = result.model_dump()
+            structured_data["fichier_source"] = file_name
+            
+            # Normaliser les données pour corriger les erreurs de format (listes)
+            structured_data = normalize_extracted_data(structured_data, supplier)
+            
+            # Ré-validater avec le schéma après normalisation
+            if supplier == "vitraglass":
+                validated = VitraglassInvoiceSchema(**structured_data)
+                structured_data = validated.model_dump()
+            elif supplier == "soprofen":
+                validated = ProfermInvoiceSchema(**structured_data)
+                structured_data = validated.model_dump()
+            
+            return {
+                **state,
+                "structured_data": structured_data,
+                "error_message": None
+            }
         
-        # Convertir en dict pour l'état
-        structured_data = result.model_dump()
-        structured_data["fichier_source"] = file_name
-        
-        return {
-            **state,
-            "structured_data": structured_data,
-            "error_message": None
-        }
+        except Exception as parse_error:
+            # Si l'erreur vient de la validation Pydantic, essayer de récupérer les données brutes
+            logger.warning(f"⚠️ Erreur de validation, tentative de récupération des données brutes...")
+            
+            # Essayer d'extraire le JSON directement depuis le prompt
+            try:
+                # Fallback : utiliser le LLM sans structured output pour récupérer le JSON brut
+                raw_llm = ChatOllama(
+                    model=MODEL,
+                    base_url=OLLAMA_BASE_URL,
+                    timeout=TIMEOUT,
+                    format="json",
+                    temperature=0
+                )
+                
+                result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
+                import json
+                raw_data = json.loads(result_raw.content)
+                
+                # Normaliser les données
+                raw_data = normalize_extracted_data(raw_data, supplier)
+                raw_data["fichier_source"] = file_name
+                
+                # Ré-essayer la validation
+                if supplier == "vitraglass":
+                    validated = VitraglassInvoiceSchema(**raw_data)
+                    structured_data = validated.model_dump()
+                elif supplier == "soprofen":
+                    validated = ProfermInvoiceSchema(**raw_data)
+                    structured_data = validated.model_dump()
+                else:
+                    structured_data = raw_data
+                
+                logger.info(f"✅ Extraction récupérée après normalisation")
+                
+                return {
+                    **state,
+                    "structured_data": structured_data,
+                    "error_message": None
+                }
+                
+            except Exception as recovery_error:
+                logger.error(f"❌ Échec de la récupération : {str(recovery_error)}")
+                raise parse_error
     
     except Exception as e:
         logger.error(f"❌ Erreur lors de l'extraction : {str(e)}")
@@ -466,31 +840,31 @@ def validate_node(state: AgentState) -> AgentState:
 def save_node(state: AgentState) -> AgentState:
     """
     Nœud 5 : Sauvegarde les données en JSON ou CSV.
+    Adapté selon le type de document et le fournisseur.
     """
     try:
         structured_data = state["structured_data"]
         doc_type = state["doc_type"]
+        supplier = state.get("supplier", "inconnu")
         file_name = state["file_name"]
         
         if not structured_data:
             logger.error("❌ Pas de données à sauvegarder")
             return state
         
-        logger.info(f"💾 Sauvegarde des données ({doc_type})")
+        logger.info(f"💾 Sauvegarde des données ({doc_type}, {supplier})")
         
         if doc_type == "devis":
-            # Sauvegarder en JSON
+            # Sauvegarder en JSON pour les devis
             output_name = file_name.replace(".pdf", ".json")
             output_path = os.path.join(OUTPUT_DIR, output_name)
             
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(structured_data, f, ensure_ascii=False, indent=2)
             
-            file_size = os.path.getsize(output_path)
-            logger.info(f"✅ JSON sauvegardé : {output_path} ({file_size} octets)")
+            logger.info(f"✅ JSON sauvegardé : {output_path}")
         
         else:  # facture
-            # Sauvegarder en CSV
             output_name = file_name.replace(".pdf", ".csv")
             output_path = os.path.join(OUTPUT_DIR, output_name)
             
@@ -498,46 +872,44 @@ def save_node(state: AgentState) -> AgentState:
             lignes = structured_data.get("lignes", [])
             
             if not lignes:
-                logger.warning("⚠️  Aucune ligne à sauvegarder en CSV")
-                # Créer un CSV vide avec les en-têtes
-                columns = ["numero_facture", "date", "client", "reference", "designation", 
-                          "quantite", "unite", "prix_unitaire_brut", "remise_pourcentage", 
-                          "total_ht", "tva_pourcentage"]
-                with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=columns, delimiter=';')
-                    writer.writeheader()
+                logger.warning("⚠️  Aucune ligne à sauvegarder")
+                return state
+
+            # Définition des colonnes selon le fournisseur
+            if supplier == "vitraglass":
+                columns = ["numero_facture", "date", "client", "numero_commande", "bon_livraison", 
+                          "reference_commande", "designation", "hauteur_largeur", "intercalaire", 
+                          "surface", "surface_totale", "quantite", "prix_unitaire_brut", "total_ht", "tva_pourcentage"]
+            elif supplier == "soprofen":
+                # SOPROFEN utilise le même format que PROFERM (références SOI)
+                columns = ["numero_facture", "date", "client", "reference_soi", "designation", 
+                          "dimensions", "quantite", "unite", "prix_unitaire_brut", "total_ht", "tva_pourcentage"]
             else:
-                # Colonnes
-                entete_columns = ["numero_facture", "date", "client"]
-                ligne_columns = ["reference", "designation", "quantite", "unite", 
-                                "prix_unitaire_brut", "remise_pourcentage", "total_ht", "tva_pourcentage"]
-                columns = entete_columns + ligne_columns
-                
-                # Valeurs d'en-tête
-                entete_values = {
-                    "numero_facture": entete.get("numero_facture", ""),
-                    "date": entete.get("date", ""),
-                    "client": entete.get("client_nom", "")
-                }
-                
-                # Écrire le CSV
-                with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=columns, delimiter=';', extrasaction='ignore')
-                    writer.writeheader()
-                    
-                    for ligne in lignes:
-                        row = {**entete_values, **ligne}
-                        writer.writerow(row)
+                # Format par défaut pour fournisseurs inconnus
+                columns = ["numero_facture", "date", "client", "reference", "designation", 
+                          "quantite", "unite", "prix_unitaire_brut", "total_ht", "tva_pourcentage"]
             
-            file_size = os.path.getsize(output_path)
-            logger.info(f"✅ CSV sauvegardé : {output_path} ({file_size} octets, {len(lignes)} lignes)")
+            # Valeurs communes d'en-tête
+            entete_values = {
+                "numero_facture": entete.get("numero_facture", ""),
+                "date": entete.get("date", ""),
+                "client": entete.get("client_nom", "")
+            }
+            
+            # Écrire le CSV avec point-virgule comme séparateur (standard français Excel)
+            with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=columns, delimiter=';', extrasaction='ignore')
+                writer.writeheader()
+                for ligne in lignes:
+                    row = {**entete_values, **ligne}
+                    writer.writerow(row)
+            
+            logger.info(f"✅ CSV sauvegardé ({supplier}) : {output_path}")
         
         return state
     
     except Exception as e:
         logger.error(f"❌ Erreur lors de la sauvegarde : {str(e)}")
-        import traceback
-        logger.debug(traceback.format_exc())
         return state
 
 
@@ -574,6 +946,7 @@ def build_graph():
     # Ajouter les nœuds
     workflow.add_node("partition", partition_node)
     workflow.add_node("router", router_node)
+    workflow.add_node("detect_supplier", detect_supplier_node)
     workflow.add_node("extract", extract_node)
     workflow.add_node("validate", validate_node)
     workflow.add_node("save", save_node)
@@ -583,7 +956,8 @@ def build_graph():
     
     # Définir les transitions
     workflow.add_edge("partition", "router")
-    workflow.add_edge("router", "extract")
+    workflow.add_edge("router", "detect_supplier")
+    workflow.add_edge("detect_supplier", "extract")
     workflow.add_edge("extract", "validate")
     
     # Transition conditionnelle : retry ou save
@@ -603,77 +977,368 @@ def build_graph():
 
 
 # ============================================================================
+# TRAITEMENT ASYNCHRONE D'UN FICHIER
+# ============================================================================
+
+def process_single_file(app, pdf_path: str, file_index: int, total_files: int) -> tuple[str, bool, float, Optional[str]]:
+    """
+    Traite un seul fichier PDF de manière synchrone.
+    Retourne: (nom_fichier, succès, durée, message_erreur)
+    """
+    pdf_name = os.path.basename(pdf_path)
+    
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"Fichier {file_index}/{total_files} : {pdf_name}")
+    logger.info("=" * 60)
+    
+    # État initial pour ce fichier
+    initial_state: AgentState = {
+        "file_path": pdf_path,
+        "file_name": pdf_name,
+        "doc_markdown": None,
+        "doc_type": None,
+        "supplier": None,
+        "structured_data": None,
+        "is_valid": False,
+        "retry_count": 0,
+        "error_message": None
+    }
+    
+    try:
+        # Exécuter le graphe
+        start_time = datetime.now()
+        final_state = app.invoke(initial_state)
+        elapsed = (datetime.now() - start_time).total_seconds()
+        
+        if final_state.get("structured_data"):
+            logger.info(f"✅ Traitement terminé avec succès en {elapsed:.2f}s : {pdf_name}")
+            return (pdf_name, True, elapsed, None)
+        else:
+            error_msg = final_state.get("error_message", "Pas de données structurées extraites")
+            logger.error(f"❌ Échec du traitement : {pdf_name}")
+            logger.error(f"   Erreur : {error_msg}")
+            return (pdf_name, False, elapsed, error_msg)
+    
+    except Exception as e:
+        elapsed = 0
+        error_msg = str(e)
+        logger.error(f"❌ Erreur critique lors du traitement de {pdf_name} : {error_msg}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return (pdf_name, False, elapsed, error_msg)
+
+
+# ============================================================================
+# FONCTIONS UTILITAIRES
+# ============================================================================
+
+def is_file_processed(pdf_name: str) -> bool:
+    """
+    Vérifie si un fichier PDF a déjà été traité en cherchant son fichier de sortie.
+    """
+    # Chercher le fichier JSON ou CSV correspondant
+    base_name = pdf_name.replace(".pdf", "")
+    json_output = os.path.join(OUTPUT_DIR, f"{base_name}.json")
+    csv_output = os.path.join(OUTPUT_DIR, f"{base_name}.csv")
+    
+    return os.path.exists(json_output) or os.path.exists(csv_output)
+
+
+def get_pending_pdf_files() -> List[str]:
+    """
+    Récupère la liste des fichiers PDF dans input/ qui n'ont pas encore été traités.
+    """
+    all_pdfs = glob.glob(os.path.join(INPUT_DIR, "*.pdf"))
+    pending = [pdf for pdf in all_pdfs if not is_file_processed(os.path.basename(pdf))]
+    return sorted(pending)
+
+
+def process_pdf_files(app, pdf_files: List[str]) -> tuple[int, int, float]:
+    """
+    Traite une liste de fichiers PDF et retourne (succès, échecs, durée).
+    """
+    if not pdf_files:
+        return (0, 0, 0.0)
+    
+    total_files = len(pdf_files)
+    logger.info(f"📚 {total_files} fichier(s) PDF à traiter")
+    
+    # Traitement parallèle avec ThreadPoolExecutor
+    results = []
+    start_total = datetime.now()
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Soumettre toutes les tâches
+        future_to_file = {
+            executor.submit(process_single_file, app, pdf_path, idx + 1, total_files): pdf_path
+            for idx, pdf_path in enumerate(pdf_files)
+        }
+        
+        # Collecter les résultats au fur et à mesure
+        for future in as_completed(future_to_file):
+            pdf_path = future_to_file[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                pdf_name = os.path.basename(pdf_path)
+                logger.error(f"❌ Exception non gérée pour {pdf_name} : {str(e)}")
+                results.append((pdf_name, False, 0, str(e)))
+    
+    # Résumé
+    elapsed_total = (datetime.now() - start_total).total_seconds()
+    successful = sum(1 for _, success, _, _ in results if success)
+    failed = total_files - successful
+    
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"✨ Traitement terminé ! {total_files} fichier(s) traité(s) en {elapsed_total:.2f}s")
+    logger.info(f"   ✅ Succès : {successful}")
+    if failed > 0:
+        logger.info(f"   ❌ Échecs : {failed}")
+    logger.info(f"   ⚡ Parallélisme : {MAX_WORKERS} worker(s)")
+    logger.info("=" * 60)
+    
+    return (successful, failed, elapsed_total)
+
+
+# ============================================================================
+# GESTIONNAIRE D'ÉVÉNEMENTS FICHIERS
+# ============================================================================
+
+class PDFFileHandler(FileSystemEventHandler):
+    """
+    Gestionnaire d'événements qui détecte l'ajout de fichiers PDF
+    et déclenche leur traitement.
+    Utilisé avec PollingObserver pour une détection fiable sur volumes Docker/Windows.
+    """
+    
+    def __init__(self, app, files_in_progress: set):
+        super().__init__()
+        self.app = app
+        self.files_in_progress = files_in_progress
+        self.processing_lock = threading.Lock()
+        self.pending_files = set()
+        self.known_files = set()  # Cache des fichiers déjà vus (évite les doublons)
+        self.debounce_timer = None
+        self.debounce_delay = 1.0  # Délai en secondes pour éviter les doublons
+    
+    def on_created(self, event: FileSystemEvent):
+        """Appelé lorsqu'un fichier ou dossier est créé."""
+        logger.debug(f"🔍 Événement détecté (created): {event.src_path}")
+        self._handle_file_event(event)
+    
+    def on_modified(self, event: FileSystemEvent):
+        """Appelé lorsqu'un fichier est modifié (utile pour les fichiers copiés progressivement)."""
+        logger.debug(f"🔍 Événement détecté (modified): {event.src_path}")
+        self._handle_file_event(event)
+    
+    def _handle_file_event(self, event: FileSystemEvent):
+        """Traite un événement de fichier."""
+        if event.is_directory:
+            return
+        
+        file_path = event.src_path
+        
+        # Vérifier si c'est un fichier PDF
+        if not file_path.lower().endswith('.pdf'):
+            logger.debug(f"   ⏭️  Ignoré (pas un PDF): {os.path.basename(file_path)}")
+            return
+        
+        # Normaliser le chemin
+        file_path = os.path.abspath(file_path)
+        
+        # Vérifier si le fichier est dans le répertoire input
+        input_dir_abs = os.path.abspath(INPUT_DIR)
+        if not file_path.startswith(input_dir_abs):
+            logger.debug(f"   ⏭️  Ignoré (hors du répertoire input): {file_path}")
+            return
+        
+        logger.info(f"📥 Nouveau fichier détecté : {os.path.basename(file_path)}")
+        
+        # Ajouter à la liste des fichiers en attente
+        with self.processing_lock:
+            # Ignorer si déjà connu (évite les doublons avec le polling)
+            if file_path in self.known_files:
+                logger.debug(f"   ⏭️  Fichier déjà connu, ignoré : {os.path.basename(file_path)}")
+                return
+            self.pending_files.add(file_path)
+        
+        # Utiliser un délai pour éviter de traiter un fichier en cours d'écriture
+        # et grouper plusieurs fichiers ajoutés rapidement
+        if self.debounce_timer:
+            self.debounce_timer.cancel()
+        
+        self.debounce_timer = threading.Timer(self.debounce_delay, self._process_pending_files)
+        self.debounce_timer.start()
+    
+    def _process_pending_files(self):
+        """Traite les fichiers en attente après le délai de debounce."""
+        with self.processing_lock:
+            if not self.pending_files:
+                return
+            
+            # Récupérer les fichiers à traiter
+            files_to_process = list(self.pending_files)
+            self.pending_files.clear()
+        
+        # Filtrer ceux qui sont déjà traités ou en cours
+        new_files = []
+        for file_path in files_to_process:
+            # Normaliser le chemin
+            file_path = os.path.abspath(file_path)
+            # Vérifier que le fichier existe et n'est plus en cours d'écriture
+            if not os.path.exists(file_path):
+                continue
+            
+            try:
+                # Vérifier que le fichier n'est plus en cours d'écriture
+                # En comparant la taille à deux moments différents (avec un petit délai)
+                size1 = os.path.getsize(file_path)
+                threading.Event().wait(0.1)  # Attendre 100ms
+                size2 = os.path.getsize(file_path)
+                
+                # Si la taille a changé, le fichier est encore en cours d'écriture
+                if size1 != size2:
+                    logger.info(f"⏳ Fichier en cours d'écriture, report du traitement : {os.path.basename(file_path)}")
+                    # Remettre dans la file d'attente pour traitement ultérieur
+                    with self.processing_lock:
+                        self.pending_files.add(file_path)
+                    # Reprogrammer le traitement après un délai supplémentaire
+                    self.debounce_timer = threading.Timer(self.debounce_delay, self._process_pending_files)
+                    self.debounce_timer.start()
+                    continue
+            except (OSError, IOError) as e:
+                logger.warning(f"⚠️  Erreur lors de la vérification du fichier {os.path.basename(file_path)} : {str(e)}")
+                continue
+            
+            # Vérifier si le fichier est déjà traité
+            if is_file_processed(os.path.basename(file_path)):
+                logger.info(f"⏭️  Fichier déjà traité, ignoré : {os.path.basename(file_path)}")
+                continue
+            
+            # Vérifier si le fichier est en cours de traitement
+            if file_path in self.files_in_progress:
+                continue
+            
+            new_files.append(file_path)
+        
+        if not new_files:
+            return
+        
+        # Marquer les fichiers comme en cours de traitement
+        for f in new_files:
+            self.files_in_progress.add(f)
+        
+        try:
+            # Traiter les nouveaux fichiers
+            logger.info(f"🚀 Démarrage du traitement de {len(new_files)} fichier(s)...")
+            successful, failed, elapsed = process_pdf_files(self.app, new_files)
+            
+            logger.info("")
+            logger.info("🔄 Retour en mode surveillance...")
+            logger.info("   (En attente de nouveaux fichiers PDF dans 'input')")
+            logger.info("")
+        except Exception as e:
+            logger.error(f"❌ Erreur lors du traitement des fichiers : {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            # Retirer les fichiers de l'ensemble après traitement
+            for f in new_files:
+                self.files_in_progress.discard(f)
+                # Ajouter au cache des fichiers connus
+                with self.processing_lock:
+                    self.known_files.add(f)
+
+
+# ============================================================================
 # FONCTION PRINCIPALE
 # ============================================================================
 
 def main():
     logger.info("=" * 60)
-    logger.info(f"Démarrage avec LangGraph + Docling + Ministral 3B")
+    logger.info(f"Démarrage avec LangGraph + PDF Native/OCR + Ministral 3B")
     logger.info(f"Modèle : {MODEL}")
     logger.info(f"Répertoire d'entrée : {INPUT_DIR}")
     logger.info(f"Répertoire de sortie : {OUTPUT_DIR}")
     logger.info(f"URL Ollama : {OLLAMA_BASE_URL}")
+    logger.info(f"Parallélisme : {MAX_WORKERS} fichier(s) simultané(s)")
     logger.info("=" * 60)
     
-    # Construire le graphe
+    # Construire le graphe (une seule instance partagée)
     logger.info("🔧 Construction du graphe LangGraph...")
     app = build_graph()
     logger.info("✅ Graphe compilé avec succès")
+    logger.info("")
     
-    # Récupérer les fichiers PDF
-    pdf_files = glob.glob(os.path.join(INPUT_DIR, "*.pdf"))
-    pdf_files.sort()
+    # Ensemble pour suivre les fichiers en cours de traitement (thread-safe)
+    files_in_progress = set()
     
-    if not pdf_files:
-        logger.warning(f"Aucun fichier PDF trouvé dans {INPUT_DIR}")
-        return
+    # Créer le gestionnaire d'événements
+    event_handler = PDFFileHandler(app, files_in_progress)
     
-    total_files = len(pdf_files)
-    logger.info(f"📚 {total_files} fichier(s) PDF à traiter")
-    
-    # Traiter chaque fichier (séquentiel pour cette version, parallélisation future possible)
-    for file_index, pdf_path in enumerate(pdf_files, start=1):
+    # Initialiser le cache des fichiers connus avec les fichiers déjà traités
+    all_pdfs = glob.glob(os.path.join(INPUT_DIR, "*.pdf"))
+    for pdf_path in all_pdfs:
         pdf_name = os.path.basename(pdf_path)
-        
+        if is_file_processed(pdf_name):
+            event_handler.known_files.add(os.path.abspath(pdf_path))
+    
+    # Traiter les fichiers existants non traités au démarrage
+    existing_files = get_pending_pdf_files()
+    if existing_files:
+        logger.info(f"📂 {len(existing_files)} fichier(s) PDF existant(s) détecté(s), traitement...")
+        logger.info("")
+        try:
+            successful, failed, elapsed = process_pdf_files(app, existing_files)
+            # Ajouter les fichiers traités au cache
+            for pdf_path in existing_files:
+                event_handler.known_files.add(os.path.abspath(pdf_path))
+            logger.info("")
+            logger.info("🔄 Passage en mode surveillance des nouveaux fichiers...")
+            logger.info("")
+        except Exception as e:
+            logger.error(f"❌ Erreur lors du traitement des fichiers existants : {str(e)}")
+    
+    # Créer l'observateur PollingObserver (optimisé pour volumes Docker/Windows)
+    # timeout=POLL_INTERVAL définit l'intervalle de vérification en secondes
+    observer = Observer(timeout=POLL_INTERVAL)
+    observer.schedule(event_handler, INPUT_DIR, recursive=False)
+    
+    logger.info("🔄 Mode surveillance activé (PollingObserver)")
+    logger.info(f"   Intervalle de polling : {POLL_INTERVAL}s (optimisé pour volumes Docker/Windows)")
+    logger.info("   (Déposez des fichiers dans le répertoire 'input' pour les traiter)")
+    logger.info("")
+    
+    # Démarrer l'observateur
+    observer.start()
+    logger.info("✅ PollingObserver démarré avec succès")
+    logger.info("")
+    
+    try:
+        # Maintenir le processus actif
+        logger.info("✅ Surveillance active, en attente de nouveaux fichiers...")
+        logger.info(f"   (Vérification automatique toutes les {POLL_INTERVAL}s)")
+        logger.info("")
+        observer.join()
+    except KeyboardInterrupt:
         logger.info("")
         logger.info("=" * 60)
-        logger.info(f"Fichier {file_index}/{total_files} : {pdf_name}")
+        logger.info("🛑 Arrêt demandé par l'utilisateur")
         logger.info("=" * 60)
-        
-        # État initial pour ce fichier
-        initial_state: AgentState = {
-            "file_path": pdf_path,
-            "file_name": pdf_name,
-            "doc_markdown": None,
-            "doc_type": None,
-            "structured_data": None,
-            "is_valid": False,
-            "retry_count": 0,
-            "error_message": None
-        }
-        
-        try:
-            # Exécuter le graphe
-            start_time = datetime.now()
-            final_state = app.invoke(initial_state)
-            elapsed = (datetime.now() - start_time).total_seconds()
-            
-            if final_state.get("structured_data"):
-                logger.info(f"✅ Traitement terminé avec succès en {elapsed:.2f}s : {pdf_name}")
-            else:
-                logger.error(f"❌ Échec du traitement : {pdf_name}")
-                if final_state.get("error_message"):
-                    logger.error(f"   Erreur : {final_state['error_message']}")
-        
-        except Exception as e:
-            logger.error(f"❌ Erreur critique lors du traitement de {pdf_name} : {str(e)}")
-            import traceback
-            logger.debug(traceback.format_exc())
-    
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info(f"✨ Traitement terminé ! {total_files} fichier(s) traité(s)")
-    logger.info("=" * 60)
+        observer.stop()
+    except Exception as e:
+        logger.error(f"❌ Erreur critique dans le gestionnaire de surveillance : {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        observer.stop()
+        raise
+    finally:
+        observer.join(timeout=5)
+        if observer.is_alive():
+            logger.warning("⚠️  L'observateur n'a pas pu s'arrêter proprement")
 
 
 if __name__ == "__main__":
