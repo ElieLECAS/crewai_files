@@ -3,6 +3,6 @@ langchain-community
 langchain-ollama
 pydantic>=2.0.0
 python-dotenv
-pdfplumber
-pdf2image
+langgraph
+docling
 pillow
