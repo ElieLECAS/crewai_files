@@ -88,7 +88,10 @@
                     <td>{{ doc.metadata.date_extraction[:10] if doc.metadata.date_extraction else '-' }}</td>
                     {% endif %}
                     <td>
-                        <a href="/documents/{{ collection_name }}/{{ doc._id }}" class="btn btn-sm btn-primary">Voir</a>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <a href="/documents/{{ collection_name }}/{{ doc._id }}" class="btn btn-sm btn-secondary">Voir</a>
+                            <a href="/documents/{{ collection_name }}/{{ doc._id }}/excel" class="btn btn-sm btn-primary">Excel</a>
+                        </div>
                     </td>
                 </tr>
                 {% endfor %}
@@ -260,11 +263,23 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // Actions
             const cell7 = row.insertCell();
+            const actionDiv = document.createElement('div');
+            actionDiv.style.display = 'flex';
+            actionDiv.style.gap = '0.5rem';
+
             const link = document.createElement('a');
             link.href = `/documents/${collectionName}/${doc._id}`;
-            link.className = 'btn btn-sm btn-primary';
+            link.className = 'btn btn-sm btn-secondary';
             link.textContent = 'Voir';
-            cell7.appendChild(link);
+            actionDiv.appendChild(link);
+
+            const excelLink = document.createElement('a');
+            excelLink.href = `/documents/${collectionName}/${doc._id}/excel`;
+            excelLink.className = 'btn btn-sm btn-primary';
+            excelLink.textContent = 'Excel';
+            actionDiv.appendChild(excelLink);
+
+            cell7.appendChild(actionDiv);
             {% elif collection_name == "devis" %}
             // Numéro devis
             const cell3 = row.insertCell();
@@ -285,11 +300,23 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // Actions
             const cell7 = row.insertCell();
+            const actionDiv = document.createElement('div');
+            actionDiv.style.display = 'flex';
+            actionDiv.style.gap = '0.5rem';
+
             const link = document.createElement('a');
             link.href = `/documents/${collectionName}/${doc._id}`;
-            link.className = 'btn btn-sm btn-primary';
+            link.className = 'btn btn-sm btn-secondary';
             link.textContent = 'Voir';
-            cell7.appendChild(link);
+            actionDiv.appendChild(link);
+
+            const excelLink = document.createElement('a');
+            excelLink.href = `/documents/${collectionName}/${doc._id}/excel`;
+            excelLink.className = 'btn btn-sm btn-primary';
+            excelLink.textContent = 'Excel';
+            actionDiv.appendChild(excelLink);
+
+            cell7.appendChild(actionDiv);
             {% else %}
             // Date extraction
             const cell3 = row.insertCell();
@@ -297,11 +324,23 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // Actions
             const cell4 = row.insertCell();
-            const link = document.createElement('a');
-            link.href = `/documents/${collectionName}/${doc._id}`;
-            link.className = 'btn btn-sm btn-primary';
-            link.textContent = 'Voir';
-            cell4.appendChild(link);
+            const actionDivOther = document.createElement('div');
+            actionDivOther.style.display = 'flex';
+            actionDivOther.style.gap = '0.5rem';
+
+            const linkOther = document.createElement('a');
+            linkOther.href = `/documents/${collectionName}/${doc._id}`;
+            linkOther.className = 'btn btn-sm btn-secondary';
+            linkOther.textContent = 'Voir';
+            actionDivOther.appendChild(linkOther);
+
+            const excelLinkOther = document.createElement('a');
+            excelLinkOther.href = `/documents/${collectionName}/${doc._id}/excel`;
+            excelLinkOther.className = 'btn btn-sm btn-primary';
+            excelLinkOther.textContent = 'Excel';
+            actionDivOther.appendChild(excelLinkOther);
+
+            cell4.appendChild(actionDivOther);
             {% endif %}
         });
     }

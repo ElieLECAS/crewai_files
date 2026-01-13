@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+
+{% block title %}Tableaux agrégés: {{ supplier_name }} - Gestion Documents{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <a href="/suppliers/{{ supplier_name }}" class="back-link">← Retour au fournisseur</a>
+        <h1>Tableaux agrégés - {{ supplier_name }}</h1>
+        <p class="subtitle">Vue consolidée de tous les documents</p>
+    </div>
+
+    <!-- Tableau agrégé des lignes de factures -->
+    {% if documents.factures %}
+    <div class="detail-section" style="margin-bottom: 2rem;">
+        <h2>Lignes de facturation agrégées</h2>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>N° Facture</th>
+                        <th>Date</th>
+                        <th>Client</th>
+                        <th>Référence</th>
+                        <th>Désignation</th>
+                        <th>Quantité</th>
+                        <th>Prix unitaire</th>
+                        <th>Total HT</th>
+                        <th>TVA %</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for doc in documents.factures %}
+                        {% if doc.lignes %}
+                            {% for ligne in doc.lignes %}
+                            <tr>
+                                <td>{{ doc.entete.numero_facture or 'N/A' }}</td>
+                                <td>{{ doc.entete.date or 'N/A' }}</td>
+                                <td>{{ doc.entete.client_nom or 'N/A' }}</td>
+                                <td>{{ ligne.reference or ligne.numero_commande or ligne.reference_soi or '-' }}</td>
+                                <td>{{ ligne.designation or '-' }}</td>
+                                <td>{{ ligne.quantite or '-' }}</td>
+                                <td class="amount">{{ ligne.prix_unitaire_brut or '-' }} €</td>
+                                <td class="amount">{{ ligne.total_ht or '-' }} €</td>
+                                <td>{{ ligne.tva_pourcentage or '-' }}%</td>
+                            </tr>
+                            {% endfor %}
+                        {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% else %}
+    <div class="detail-section" style="margin-bottom: 2rem;">
+        <h2>Lignes de facturation agrégées</h2>
+        <p class="empty-state">Aucune facture pour ce fournisseur.</p>
+    </div>
+    {% endif %}
+
+    <!-- Tableau agrégé des prestations de devis -->
+    {% if documents.devis %}
+    <div class="detail-section" style="margin-bottom: 2rem;">
+        <h2>Prestations de devis agrégées</h2>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>N° Devis</th>
+                        <th>Date émission</th>
+                        <th>Client</th>
+                        <th>Désignation</th>
+                        <th>Dimensions</th>
+                        <th>Couleur ext.</th>
+                        <th>Couleur int.</th>
+                        <th>Quantité</th>
+                        <th>Prix unitaire</th>
+                        <th>Total HT</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for doc in documents.devis %}
+                        {% if doc.prestations %}
+                            {% for prestation in doc.prestations %}
+                            <tr>
+                                <td>{{ doc.entete.numero_devis or 'N/A' }}</td>
+                                <td>{{ doc.entete.date_emission or 'N/A' }}</td>
+                                <td>{{ doc.entete.client_nom or 'N/A' }}</td>
+                                <td>{{ prestation.designation or '-' }}</td>
+                                <td>{{ prestation.dimensions or '-' }}</td>
+                                <td>{{ prestation.couleur_exterieure or '-' }}</td>
+                                <td>{{ prestation.couleur_interieure or '-' }}</td>
+                                <td>{{ prestation.quantite or '-' }}</td>
+                                <td class="amount">{{ prestation.prix_unitaire_brut or '-' }} €</td>
+                                <td class="amount">{{ prestation.total_ht or '-' }} €</td>
+                            </tr>
+                            {% endfor %}
+                        {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% else %}
+    <div class="detail-section" style="margin-bottom: 2rem;">
+        <h2>Prestations de devis agrégées</h2>
+        <p class="empty-state">Aucun devis pour ce fournisseur.</p>
+    </div>
+    {% endif %}
+
+    <!-- Tableau agrégé des lignes de bons de livraison -->
+    {% if documents.bons_livraison %}
+    <div class="detail-section">
+        <h2>Lignes de bons de livraison agrégées</h2>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Fichier Source</th>
+                        <th>Référence</th>
+                        <th>Désignation</th>
+                        <th>Quantité</th>
+                        <th>Prix unitaire</th>
+                        <th>Total HT</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for doc in documents.bons_livraison %}
+                        {% if doc.lignes %}
+                            {% for ligne in doc.lignes %}
+                            <tr>
+                                <td>{{ doc.metadata.date_extraction.strftime('%Y-%m-%d') if doc.metadata.date_extraction else 'N/A' }}</td>
+                                <td>{{ doc.metadata.fichier_source or 'N/A' }}</td>
+                                <td>{{ ligne.reference or ligne.numero_commande or ligne.reference_soi or '-' }}</td>
+                                <td>{{ ligne.designation or '-' }}</td>
+                                <td>{{ ligne.quantite or '-' }}</td>
+                                <td class="amount">{{ ligne.prix_unitaire_brut or '-' }} €</td>
+                                <td class="amount">{{ ligne.total_ht or '-' }} €</td>
+                            </tr>
+                            {% endfor %}
+                        {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% else %}
+    <div class="detail-section">
+        <h2>Lignes de bons de livraison agrégées</h2>
+        <p class="empty-state">Aucun bon de livraison pour ce fournisseur.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

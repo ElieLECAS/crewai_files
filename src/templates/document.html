@@ -5,8 +5,13 @@
 {% block content %}
 <div class="container">
     <div class="page-header">
-        <a href="/collections/{{ collection_name }}" class="back-link">← Retour à {{ display_name }}</a>
-        <h1>{{ document.metadata.fichier_source }}</h1>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <a href="/collections/{{ collection_name }}" class="back-link">← Retour à {{ display_name }}</a>
+                <h1>{{ document.metadata.fichier_source }}</h1>
+            </div>
+            <a href="/documents/{{ collection_name }}/{{ document._id }}/excel" class="btn btn-primary">Exporter en Excel</a>
+        </div>
     </div>
 
     <div class="document-details">

@@ -88,3 +88,64 @@ def insert_document(supplier: str, doc_type: str, data: Dict[str, Any], contenu_
     except Exception as e:
         logger.error(f"❌ Erreur MongoDB : {str(e)}")
         raise
+
+
+def is_document_exists(filename: str) -> bool:
+    """Vérifie si un document avec ce nom de fichier existe dans l'une des collections."""
+    try:
+        db = get_connection()
+        for coll_name in ["factures", "devis", "bons_livraison"]:
+            if db[coll_name].find_one({"metadata.fichier_source": filename}):
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"Erreur lors de la vérification de l'existence du document : {str(e)}")
+        return False
+
+
+def get_all_suppliers():
+    """Récupère la liste de tous les fournisseurs uniques à travers toutes les collections."""
+    try:
+        db = get_connection()
+        suppliers_data = {}
+        for coll_name in ["factures", "devis", "bons_livraison"]:
+            # On récupère les noms de fournisseurs uniques et leurs IDs
+            docs = db[coll_name].find({}, {"metadata.nom_fournisseur": 1, "metadata.fournisseur_id": 1})
+            for doc in docs:
+                name = doc.get("metadata", {}).get("nom_fournisseur")
+                sid = doc.get("metadata", {}).get("fournisseur_id")
+                if name and name != "inconnu":
+                    suppliers_data[name] = sid
+        
+        result = []
+        for name in sorted(suppliers_data.keys()):
+            result.append({
+                "id": suppliers_data[name],
+                "name": name
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des fournisseurs : {str(e)}")
+        return []
+
+
+def get_documents_by_supplier(supplier_name: str):
+    """Récupère tous les documents d'un fournisseur, groupés par type."""
+    try:
+        db = get_connection()
+        result = {
+            "factures": [],
+            "devis": [],
+            "bons_livraison": []
+        }
+        
+        query = {"metadata.nom_fournisseur": supplier_name}
+        
+        result["factures"] = list(db["factures"].find(query).sort("metadata.date_extraction", -1))
+        result["devis"] = list(db["devis"].find(query).sort("metadata.date_extraction", -1))
+        result["bons_livraison"] = list(db["bons_livraison"].find(query).sort("metadata.date_extraction", -1))
+        
+        return result
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération des documents par fournisseur : {str(e)}")
+        return {"factures": [], "devis": [], "bons_livraison": []}

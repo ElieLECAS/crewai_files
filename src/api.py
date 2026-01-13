@@ -3,16 +3,22 @@ import shutil
 import logging
 import uuid
 import asyncio
+import pandas as pd
+import io
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi import Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from bson import ObjectId
 from datetime import datetime, timedelta
-from src.database import get_connection
+from src.database import (
+    get_connection, 
+    get_all_suppliers, 
+    get_documents_by_supplier
+)
 from src.main import build_graph, process_single_file
 
 logger = logging.getLogger(__name__)
@@ -212,6 +218,108 @@ async def document_detail(request: Request, collection_name: str, document_id: s
     except Exception as e:
         logger.error(f"Erreur lors de la récupération du document : {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/documents/{collection_name}/{document_id}/excel")
+async def export_document_excel(collection_name: str, document_id: str):
+    """Exporte un document spécifique au format Excel."""
+    db = get_connection()
+    valid_collections = ["factures", "devis", "bons_livraison"]
+    if collection_name not in valid_collections:
+        raise HTTPException(status_code=404, detail="Collection non trouvée")
+    
+    collection = db[collection_name]
+    
+    try:
+        document = collection.find_one({"_id": ObjectId(document_id)})
+        if not document:
+            raise HTTPException(status_code=404, detail="Document non trouvé")
+        
+        # Préparation des données pour Excel
+        entete = document.get("entete", {})
+        metadata = document.get("metadata", {})
+        
+        output = io.BytesIO()
+        
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Onglet Entête
+            df_entete = pd.DataFrame([entete])
+            df_entete.to_excel(writer, sheet_name='Entete', index=False)
+            
+            # Onglet Lignes/Prestations
+            if collection_name == "devis":
+                lignes = document.get("prestations", [])
+                sheet_name = 'Prestations'
+            else:
+                lignes = document.get("lignes", [])
+                sheet_name = 'Lignes'
+            
+            if lignes:
+                df_lignes = pd.DataFrame(lignes)
+                # Ajouter les infos d'entête à chaque ligne pour faciliter le traitement Excel
+                for key, value in entete.items():
+                    if key not in df_lignes.columns:
+                        df_lignes[key] = value
+                df_lignes.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+            # Onglet Metadata
+            df_meta = pd.DataFrame([metadata])
+            df_meta.to_excel(writer, sheet_name='Metadata', index=False)
+        
+        output.seek(0)
+        filename = metadata.get("fichier_source", "document").replace(".pdf", ".xlsx")
+        
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de l'export Excel : {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/suppliers", response_class=HTMLResponse)
+async def suppliers_page(request: Request):
+    """Page listant tous les fournisseurs."""
+    suppliers = get_all_suppliers()
+    return templates.TemplateResponse("suppliers.html", {
+        "request": request,
+        "suppliers": suppliers
+    })
+
+
+@app.get("/suppliers/{supplier_name}", response_class=HTMLResponse)
+async def supplier_detail(request: Request, supplier_name: str):
+    """Détails d'un fournisseur avec agrégation de tous ses documents."""
+    docs = get_documents_by_supplier(supplier_name)
+    
+    # Convertir les ObjectIds pour les templates
+    for doc_type in docs:
+        docs[doc_type] = [convert_objectid(doc) for doc in docs[doc_type]]
+    
+    return templates.TemplateResponse("supplier_detail.html", {
+        "request": request,
+        "supplier_name": supplier_name,
+        "documents": docs
+    })
+
+
+@app.get("/suppliers/{supplier_name}/aggregated", response_class=HTMLResponse)
+async def supplier_aggregated(request: Request, supplier_name: str):
+    """Tableaux agrégés de tous les documents d'un fournisseur."""
+    docs = get_documents_by_supplier(supplier_name)
+    
+    # Convertir les ObjectIds pour les templates
+    for doc_type in docs:
+        docs[doc_type] = [convert_objectid(doc) for doc in docs[doc_type]]
+    
+    return templates.TemplateResponse("supplier_aggregated.html", {
+        "request": request,
+        "supplier_name": supplier_name,
+        "documents": docs
+    })
 
 
 def run_processing_task(task_id: str, file_path: str, filename: str):

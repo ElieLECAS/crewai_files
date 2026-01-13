@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+
+{% block title %}Fournisseur: {{ supplier_name }} - Gestion Documents{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <a href="/suppliers" class="back-link">← Retour aux fournisseurs</a>
+                <h1>{{ supplier_name }}</h1>
+                <p class="subtitle">Tous les documents pour ce fournisseur</p>
+            </div>
+            <a href="/suppliers/{{ supplier_name }}/aggregated" class="btn btn-primary">Voir les tableaux agrégés</a>
+        </div>
+    </div>
+
+    <!-- Factures -->
+    <div class="detail-section" style="margin-bottom: 2rem;">
+        <h2>Factures</h2>
+        {% if documents.factures %}
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>N° Facture</th>
+                        <th>Client</th>
+                        <th>Total TTC</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for doc in documents.factures %}
+                    <tr>
+                        <td>{{ doc.entete.date or 'N/A' }}</td>
+                        <td>{{ doc.entete.numero_facture or 'N/A' }}</td>
+                        <td>{{ doc.entete.client_nom or 'N/A' }}</td>
+                        <td class="amount">{{ doc.entete.total_ttc or '0' }} €</td>
+                        <td>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <a href="/documents/factures/{{ doc._id }}" class="btn btn-secondary btn-sm">Voir</a>
+                                <a href="/documents/factures/{{ doc._id }}/excel" class="btn btn-primary btn-sm">Excel</a>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="empty-state">Aucune facture pour ce fournisseur.</p>
+        {% endif %}
+    </div>
+
+    <!-- Devis -->
+    <div class="detail-section" style="margin-bottom: 2rem;">
+        <h2>Devis</h2>
+        {% if documents.devis %}
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>N° Devis</th>
+                        <th>Client</th>
+                        <th>Total TTC</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for doc in documents.devis %}
+                    <tr>
+                        <td>{{ doc.entete.date_emission or 'N/A' }}</td>
+                        <td>{{ doc.entete.numero_devis or 'N/A' }}</td>
+                        <td>{{ doc.entete.client_nom or 'N/A' }}</td>
+                        <td class="amount">{{ doc.totaux.total_ttc or '0' }} €</td>
+                        <td>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <a href="/documents/devis/{{ doc._id }}" class="btn btn-secondary btn-sm">Voir</a>
+                                <a href="/documents/devis/{{ doc._id }}/excel" class="btn btn-primary btn-sm">Excel</a>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="empty-state">Aucun devis pour ce fournisseur.</p>
+        {% endif %}
+    </div>
+
+    <!-- Bons de Livraison -->
+    <div class="detail-section">
+        <h2>Bons de Livraison</h2>
+        {% if documents.bons_livraison %}
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Fichier Source</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for doc in documents.bons_livraison %}
+                    <tr>
+                        <td>{{ doc.metadata.date_extraction.strftime('%Y-%m-%d') if doc.metadata.date_extraction else 'N/A' }}</td>
+                        <td>{{ doc.metadata.fichier_source or 'N/A' }}</td>
+                        <td>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <a href="/documents/bons_livraison/{{ doc._id }}" class="btn btn-secondary btn-sm">Voir</a>
+                                <a href="/documents/bons_livraison/{{ doc._id }}/excel" class="btn btn-primary btn-sm">Excel</a>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="empty-state">Aucun bon de livraison pour ce fournisseur.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

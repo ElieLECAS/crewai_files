@@ -18,7 +18,7 @@ import pytesseract
 from PIL import Image
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
-from src.database import insert_document
+from src.database import insert_document, is_document_exists
 
 # Configuration du logging avec timestamps
 logging.basicConfig(
@@ -39,9 +39,6 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # Intervalle de polling en
 
 # Chemins des volumes Docker
 INPUT_DIR = "/app/input"
-OUTPUT_DIR = "/app/output"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ============================================================================
@@ -841,86 +838,9 @@ def validate_node(state: AgentState) -> AgentState:
         return {**state, "is_valid": True}  # On accepte quand même pour ne pas bloquer
 
 
-def save_node(state: AgentState) -> AgentState:
-    """
-    Nœud 5 : Sauvegarde les données en JSON ou CSV.
-    Adapté selon le type de document et le fournisseur.
-    """
-    try:
-        structured_data = state["structured_data"]
-        doc_type = state["doc_type"]
-        supplier = state.get("supplier", "inconnu")
-        file_name = state["file_name"]
-        
-        if not structured_data:
-            logger.error("❌ Pas de données à sauvegarder")
-            return state
-        
-        logger.info(f"💾 Sauvegarde des données ({doc_type}, {supplier})")
-        
-        if doc_type == "devis":
-            # Sauvegarder en JSON pour les devis
-            output_name = file_name.replace(".pdf", ".json")
-            output_path = os.path.join(OUTPUT_DIR, output_name)
-            
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(structured_data, f, ensure_ascii=False, indent=2)
-            
-            logger.info(f"✅ JSON sauvegardé : {output_path}")
-        
-        else:  # facture
-            output_name = file_name.replace(".pdf", ".csv")
-            output_path = os.path.join(OUTPUT_DIR, output_name)
-            
-            entete = structured_data.get("entete", {})
-            lignes = structured_data.get("lignes", [])
-            
-            if not lignes:
-                logger.warning("⚠️  Aucune ligne à sauvegarder")
-                return state
-
-            # Définition des colonnes selon le fournisseur
-            if supplier == "vitraglass":
-                columns = ["numero_facture", "date", "client", "numero_commande", "bon_livraison", 
-                          "reference_commande", "designation", "hauteur_largeur", "intercalaire", 
-                          "surface", "surface_totale", "quantite", "prix_unitaire_brut", "total_ht", "tva_pourcentage"]
-            elif supplier == "soprofen":
-                # SOPROFEN utilise le même format que PROFERM (références SOI)
-                columns = ["numero_facture", "date", "client", "reference_soi", "designation", 
-                          "dimensions", "quantite", "unite", "prix_unitaire_brut", "total_ht", "tva_pourcentage"]
-            else:
-                # Format par défaut pour fournisseurs inconnus
-                columns = ["numero_facture", "date", "client", "reference", "designation", 
-                          "quantite", "unite", "prix_unitaire_brut", "total_ht", "tva_pourcentage"]
-            
-            # Valeurs communes d'en-tête
-            entete_values = {
-                "numero_facture": entete.get("numero_facture", ""),
-                "date": entete.get("date", ""),
-                "client": entete.get("client_nom", "")
-            }
-            
-            # Écrire le CSV avec point-virgule comme séparateur (standard français Excel)
-            with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=columns, delimiter=';', extrasaction='ignore')
-                writer.writeheader()
-                for ligne in lignes:
-                    row = {**entete_values, **ligne}
-                    writer.writerow(row)
-            
-            logger.info(f"✅ CSV sauvegardé ({supplier}) : {output_path}")
-        
-        return state
-    
-    except Exception as e:
-        logger.error(f"❌ Erreur lors de la sauvegarde : {str(e)}")
-        return state
-
-
 def store_db_node(state: AgentState) -> AgentState:
     """
     Nœud 6 : Stocke les données extraites dans la base de données MongoDB.
-    Inclut le contenu complet des fichiers CSV/JSON générés.
     """
     try:
         structured_data = state.get("structured_data")
@@ -934,31 +854,8 @@ def store_db_node(state: AgentState) -> AgentState:
             
         logger.info(f"🗄️ Stockage en BDD ({doc_type}, {supplier})")
         
-        # Lire le contenu du fichier CSV ou JSON généré
-        contenu_fichier = None
-        type_fichier = None
-        
-        try:
-            if doc_type == "devis":
-                output_name = file_name.replace(".pdf", ".json")
-                output_path = os.path.join(OUTPUT_DIR, output_name)
-                type_fichier = "json"
-            else:  # facture ou bon_livraison
-                output_name = file_name.replace(".pdf", ".csv")
-                output_path = os.path.join(OUTPUT_DIR, output_name)
-                type_fichier = "csv"
-            
-            if os.path.exists(output_path):
-                with open(output_path, 'r', encoding='utf-8') as f:
-                    contenu_fichier = f.read()
-                logger.info(f"✅ Contenu du fichier {type_fichier.upper()} lu ({len(contenu_fichier)} caractères)")
-            else:
-                logger.warning(f"⚠️  Fichier de sortie non trouvé : {output_path}")
-        except Exception as e:
-            logger.warning(f"⚠️  Erreur lors de la lecture du fichier de sortie : {str(e)}")
-        
-        # Appel de la fonction d'insertion avec le contenu du fichier
-        insert_document(supplier, doc_type, structured_data, contenu_fichier, type_fichier)
+        # Appel de la fonction d'insertion
+        insert_document(supplier, doc_type, structured_data)
         
         return state
         
@@ -968,7 +865,7 @@ def store_db_node(state: AgentState) -> AgentState:
         return state
 
 
-def should_retry(state: AgentState) -> Literal["extract", "save"]:
+def should_retry(state: AgentState) -> Literal["extract", "store_db"]:
     """
     Fonction de routage conditionnel : retry si l'extraction a échoué et retry_count < 3.
     Ne retry pas si le partitionnement a échoué (doc_markdown est None).
@@ -980,14 +877,14 @@ def should_retry(state: AgentState) -> Literal["extract", "save"]:
     # Si le partitionnement a échoué, ne pas retry
     if doc_markdown is None:
         logger.error("❌ Partitionnement échoué, impossible de continuer")
-        return "save"
+        return "store_db"
     
     # Retry uniquement si validation échouée et retry_count < 3
     if not is_valid and retry_count < 3:
         logger.warning(f"🔄 Nouvelle tentative d'extraction ({retry_count + 1}/3)")
         return "extract"
     else:
-        return "save"
+        return "store_db"
 
 
 # ============================================================================
@@ -1004,7 +901,6 @@ def build_graph():
     workflow.add_node("detect_supplier", detect_supplier_node)
     workflow.add_node("extract", extract_node)
     workflow.add_node("validate", validate_node)
-    workflow.add_node("save", save_node)
     workflow.add_node("store_db", store_db_node)
     
     # Définir le point d'entrée
@@ -1016,18 +912,17 @@ def build_graph():
     workflow.add_edge("detect_supplier", "extract")
     workflow.add_edge("extract", "validate")
     
-    # Transition conditionnelle : retry ou save
+    # Transition conditionnelle : retry ou store_db
     workflow.add_conditional_edges(
         "validate",
         should_retry,
         {
             "extract": "extract",
-            "save": "save"
+            "store_db": "store_db"
         }
     )
     
     # Fin du graphe
-    workflow.add_edge("save", "store_db")
     workflow.add_edge("store_db", END)
     
     return workflow.compile()
@@ -1092,14 +987,9 @@ def process_single_file(app, pdf_path: str, file_index: int, total_files: int) -
 
 def is_file_processed(pdf_name: str) -> bool:
     """
-    Vérifie si un fichier PDF a déjà été traité en cherchant son fichier de sortie.
+    Vérifie si un fichier PDF a déjà été traité en cherchant dans la base de données.
     """
-    # Chercher le fichier JSON ou CSV correspondant
-    base_name = pdf_name.replace(".pdf", "")
-    json_output = os.path.join(OUTPUT_DIR, f"{base_name}.json")
-    csv_output = os.path.join(OUTPUT_DIR, f"{base_name}.csv")
-    
-    return os.path.exists(json_output) or os.path.exists(csv_output)
+    return is_document_exists(pdf_name)
 
 
 def get_pending_pdf_files() -> List[str]:
@@ -1331,7 +1221,6 @@ def main():
     logger.info(f"Démarrage avec LangGraph + PDF Native/OCR + Ministral 3B")
     logger.info(f"Modèle : {MODEL}")
     logger.info(f"Répertoire d'entrée : {INPUT_DIR}")
-    logger.info(f"Répertoire de sortie : {OUTPUT_DIR}")
     logger.info(f"URL Ollama : {OLLAMA_BASE_URL}")
     logger.info(f"Parallélisme : {MAX_WORKERS} fichier(s) simultané(s)")
     logger.info("=" * 60)
