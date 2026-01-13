@@ -21,11 +21,13 @@
                         <th>N° Facture</th>
                         <th>Date</th>
                         <th>Client</th>
-                        <th>Référence</th>
+                        <th>N° de commande</th>
                         <th>Désignation</th>
-                        <th>Quantité</th>
-                        <th>Prix unitaire</th>
-                        <th>Total HT</th>
+                        <th>Qte</th>
+                        <th>Unite</th>
+                        <th>P.U. Brut EUR</th>
+                        <th>% Rem.</th>
+                        <th>Total EUR</th>
                         <th>TVA %</th>
                     </tr>
                 </thead>
@@ -37,10 +39,12 @@
                                 <td>{{ doc.entete.numero_facture or 'N/A' }}</td>
                                 <td>{{ doc.entete.date or 'N/A' }}</td>
                                 <td>{{ doc.entete.client_nom or 'N/A' }}</td>
-                                <td>{{ ligne.reference or ligne.numero_commande or ligne.reference_soi or '-' }}</td>
+                                <td>{{ ligne.reference_soi or ligne.reference or ligne.numero_commande or '-' }}</td>
                                 <td>{{ ligne.designation or '-' }}</td>
                                 <td>{{ ligne.quantite or '-' }}</td>
+                                <td>{{ ligne.unite or '-' }}</td>
                                 <td class="amount">{{ ligne.prix_unitaire_brut or '-' }} €</td>
+                                <td>{{ ligne.remise_pourcentage if ligne.remise_pourcentage is not none else '-' }}%</td>
                                 <td class="amount">{{ ligne.total_ht or '-' }} €</td>
                                 <td>{{ ligne.tva_pourcentage or '-' }}%</td>
                             </tr>
@@ -118,11 +122,13 @@
                     <tr>
                         <th>Date</th>
                         <th>Fichier Source</th>
-                        <th>Référence</th>
+                        <th>N° de commande</th>
                         <th>Désignation</th>
-                        <th>Quantité</th>
-                        <th>Prix unitaire</th>
-                        <th>Total HT</th>
+                        <th>Qte</th>
+                        <th>Unite</th>
+                        <th>P.U. Brut EUR</th>
+                        <th>% Rem.</th>
+                        <th>Total EUR</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -132,10 +138,12 @@
                             <tr>
                                 <td>{{ doc.metadata.date_extraction.strftime('%Y-%m-%d') if doc.metadata.date_extraction else 'N/A' }}</td>
                                 <td>{{ doc.metadata.fichier_source or 'N/A' }}</td>
-                                <td>{{ ligne.reference or ligne.numero_commande or ligne.reference_soi or '-' }}</td>
+                                <td>{{ ligne.reference_soi or ligne.reference or ligne.numero_commande or '-' }}</td>
                                 <td>{{ ligne.designation or '-' }}</td>
                                 <td>{{ ligne.quantite or '-' }}</td>
+                                <td>{{ ligne.unite or '-' }}</td>
                                 <td class="amount">{{ ligne.prix_unitaire_brut or '-' }} €</td>
+                                <td>{{ ligne.remise_pourcentage if ligne.remise_pourcentage is not none else '-' }}%</td>
                                 <td class="amount">{{ ligne.total_ht or '-' }} €</td>
                             </tr>
                             {% endfor %}

@@ -131,21 +131,25 @@
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>Référence</th>
+                            <th>N° de commande</th>
                             <th>Désignation</th>
-                            <th>Quantité</th>
-                            <th>Prix unitaire</th>
-                            <th>Total HT</th>
+                            <th>Qte</th>
+                            <th>Unite</th>
+                            <th>P.U. Brut EUR</th>
+                            <th>% Rem.</th>
+                            <th>Total EUR</th>
                             <th>TVA %</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for ligne in document.lignes %}
                         <tr>
-                            <td>{{ ligne.reference or ligne.numero_commande or '-' }}</td>
+                            <td>{{ ligne.reference_soi or ligne.reference or ligne.numero_commande or '-' }}</td>
                             <td>{{ ligne.designation }}</td>
                             <td>{{ ligne.quantite if ligne.quantite else '-' }}</td>
+                            <td>{{ ligne.unite if ligne.unite else '-' }}</td>
                             <td class="amount">{{ ligne.prix_unitaire_brut if ligne.prix_unitaire_brut else '-' }} €</td>
+                            <td>{{ ligne.remise_pourcentage if ligne.remise_pourcentage is not none else '-' }}%</td>
                             <td class="amount">{{ ligne.total_ht if ligne.total_ht else '-' }} €</td>
                             <td>{{ ligne.tva_pourcentage if ligne.tva_pourcentage else '-' }}%</td>
                         </tr>

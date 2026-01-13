@@ -85,9 +85,21 @@ class VitraglassInvoiceSchema(BaseModel):
 
 # --- PROFERM / SOPROFEN (format avec références SOI) ---
 class ProfermLineItem(LineItem):
-    """Ligne de facture spécifique à Proferm/Soprofen (format avec références SOI)."""
-    reference_soi: Optional[str] = Field(None, description="Référence SOI complète")
-    dimensions: Optional[str] = Field(None, description="Dimensions extraites de la désignation")
+    """Ligne de facture spécifique à Proferm/Soprofen (format avec références SOI).
+    
+    Structure du tableau SOPROFEN (6 colonnes principales à extraire) :
+    1. N° de commande (reference_soi) : Référence SOI complète (ex: "SOI C 25 212 004 993")
+    2. Désignation (designation) : Description complète du produit (obligatoire)
+    3. Quantité (quantite) : Nombre d'unités (ex: 1.0, 4.0)
+    4. Unité (unite) : Unité de mesure (ex: "PIECE")
+    5. P.U. Brut EUR (prix_unitaire_brut) : Prix unitaire avant remise (ex: 643.10)
+    6. % Rem. (remise_pourcentage) : Pourcentage de remise appliqué (ex: 44.5)
+    7. Total EUR (total_ht) : Montant total HT après remise (ex: 356.92)
+    
+    Tous les champs de base héritent de LineItem.
+    """
+    reference_soi: Optional[str] = Field(None, description="Référence SOI complète (N° de commande) - Colonne 1 du tableau SOPROFEN")
+    dimensions: Optional[str] = Field(None, description="Dimensions extraites de la désignation (format: L x H mm ou L * H mm)")
 
 class ProfermInvoiceSchema(BaseModel):
     """Schéma spécifique pour les factures Proferm/Soprofen."""
@@ -199,24 +211,46 @@ INVOICE_EXAMPLE_VITRAGLASS = """{
 
 INVOICE_EXAMPLE_PROFERM = """{
   "entete": {
-    "numero_facture": "W0828058",
-    "date": "2025-10-03",
+    "numero_facture": "W0848335",
+    "date": "2026-01-12",
     "client_nom": "PROFERM MULTITECHNIQUES",
-    "total_ttc": 854.70
+    "total_ttc": 1143.5
   },
   "lignes": [
     {
-      "reference_soi": "SOI C 25 209 007 195",
-      "designation": "Ligne 1 Chrono One motorisé gamme Neuf",
-      "dimensions": "1474 * 2238 mm",
+      "reference_soi": "SOI C 25 212 001 555",
+      "designation": "Ligne 1 Coffre Paco Dimension Tableau (L x H mm) : 1390 * 2100 Blanc R=0.18",
+      "dimensions": "1390 * 2100 mm",
       "quantite": 1.0,
       "unite": "PIECE",
-      "prix_unitaire_brut": 712.25,
-      "total_ht": 712.25,
+      "prix_unitaire_brut": 1183.11,
+      "remise_pourcentage": 64.0,
+      "total_ht": 425.92,
+      "tva_pourcentage": 20.0
+    },
+    {
+      "reference_soi": "SOI C 25 212 001 555",
+      "designation": "Ligne 2 Coffre Paco Dimension Tableau (L x H mm) : 790 * 970 Blanc R=0.18",
+      "dimensions": "790 * 970 mm",
+      "quantite": 1.0,
+      "unite": "PIECE",
+      "prix_unitaire_brut": 919.11,
+      "remise_pourcentage": 64.0,
+      "total_ht": 330.88,
+      "tva_pourcentage": 20.0
+    },
+    {
+      "reference_soi": "SOI C 25 210 000 406",
+      "designation": "Ligne 1 Acc à la commande MX10-55 Adaptateur 55mm, 2984mm par 1 pièces",
+      "quantite": 2.984,
+      "unite": "Mètres",
+      "prix_unitaire_brut": 19.91,
+      "remise_pourcentage": 45.0,
+      "total_ht": 32.68,
       "tva_pourcentage": 20.0
     }
   ],
-  "fichier_source": "W0828058_Demat.pdf"
+  "fichier_source": "W0848335_Demat.pdf"
 }"""
 
 QUOTE_EXAMPLE_OPTIMIZED = """{
@@ -634,7 +668,29 @@ def extract_node(state: AgentState) -> AgentState:
                 # SOPROFEN utilise un format similaire à PROFERM avec références SOI
                 schema_class = ProfermInvoiceSchema
                 example = INVOICE_EXAMPLE_PROFERM
-                instr_supp = "- Extrais les références SOI et les dimensions de chaque produit."
+                instr_supp = """- CRITIQUE : Le tableau SOPROFEN a EXACTEMENT ces colonnes dans cet ordre :
+  COLONNE 1 : "N° de commande" → reference_soi (ex: "SOI C 25 212 001 555")
+  COLONNE 2 : "Désignation" → designation (ex: "Ligne 1 Coffre Paco Dimension Tableau (L x H mm) : 1390 * 2100 Blanc R=0.18")
+  COLONNE 3 : "Qte" → quantite (NOMBRE, ex: 1,000 → 1.0 ou 2,984 → 2.984)
+  COLONNE 4 : "Unite" → unite (TEXTE, ex: "PIECE" ou "Mètres")
+  COLONNE 5 : "P.U. Brut EUR" → prix_unitaire_brut (PRIX AVANT REMISE, ex: 1183,11 → 1183.11 ou 19,91 → 19.91)
+  COLONNE 6 : "% Rem." → remise_pourcentage (POURCENTAGE, ex: 64 → 64.0 ou 45 → 45.0)
+  COLONNE 7 : "Total EUR" → total_ht (PRIX FINAL APRÈS REMISE, ex: 425,92 → 425.92 ou 32,68 → 32.68)
+
+RÈGLES ABSOLUES POUR ÉVITER LES ERREURS :
+- La colonne "Qte" contient toujours un NOMBRE (quantité d'unités) : 1,000 ou 2,984
+- La colonne "Unite" contient toujours un TEXTE : "PIECE" ou "Mètres" 
+- La colonne "P.U. Brut EUR" = PRIX UNITAIRE BRUT (avant remise) : toujours > 100 pour les pièces, ~20 pour les mètres
+- La colonne "Total EUR" = TOTAL APRÈS REMISE : toujours < P.U. Brut EUR (car remise appliquée)
+- SI tu vois 1183,11 dans "P.U. Brut EUR" et 425,92 dans "Total EUR" → NE LES INVERSE PAS !
+- SI tu vois 1,000 dans "Qte" → c'est la quantité (1.0), PAS le prix !
+
+IGNORE complètement :
+- Les lignes "Dont éco-contribution PMCB" ou "éco-contribution"
+- Les lignes "Sous totaux :"
+- Les lignes vides
+
+Extrais aussi les dimensions depuis la désignation si présentes (format "L x H mm" ou "L * H mm")"""
             else:
                 # Schéma par défaut pour fournisseurs inconnus
                 schema_class = ProfermInvoiceSchema
@@ -643,19 +699,43 @@ def extract_node(state: AgentState) -> AgentState:
 
             prompt = f"""Tu es un expert en extraction de factures PDF {supplier.upper()}.
 
-EXEMPLE DE SORTIE ATTENDUE :
+IMPORTANT : Regarde attentivement l'EXEMPLE ci-dessous pour comprendre la structure exacte attendue.
+
+EXEMPLE DE SORTIE ATTENDUE (ANALYSE BIEN CHAQUE VALEUR) :
 {example}
+
+ANALYSE DE L'EXEMPLE :
+- reference_soi = "SOI C 25 212 001 555" (colonne "N° de commande")
+- designation = texte complet (colonne "Désignation")
+- quantite = 1.0 (colonne "Qte" - C'EST UN NOMBRE, pas un prix !)
+- unite = "PIECE" (colonne "Unite" - C'EST DU TEXTE)
+- prix_unitaire_brut = 1183.11 (colonne "P.U. Brut EUR" - PRIX AVANT REMISE, valeur ÉLEVÉE)
+- remise_pourcentage = 64.0 (colonne "% Rem." - POURCENTAGE)
+- total_ht = 425.92 (colonne "Total EUR" - PRIX FINAL APRÈS REMISE, valeur BASSE)
 
 CONTENU DU DOCUMENT (MARKDOWN) :
 {doc_markdown[:8000]}
 
 INSTRUCTIONS STRICTES :
-- Extrais toutes les lignes du tableau de facturation présent dans le Markdown
 {instr_supp}
-- RÈGLE ABSOLUE : Chaque ligne doit avoir des valeurs SIMPLES (string ou nombre), JAMAIS de listes/tableaux.
-- Si tu vois plusieurs pièces avec des dimensions différentes dans le tableau, crée UNE LIGNE SÉPARÉE par pièce.
-- Chaque ligne doit représenter UNE SEULE pièce avec ses dimensions spécifiques.
-- Le fichier source est : {file_name}
+
+CONVERSION DES NOMBRES (TRÈS IMPORTANT) :
+- "1,000" → 1.0 (quantité)
+- "2,984" → 2.984 (quantité)
+- "1 183,11" ou "1183,11" → 1183.11 (prix unitaire brut)
+- "919,11" → 919.11 (prix unitaire brut)
+- "425,92" → 425.92 (total EUR)
+- "330,88" → 330.88 (total EUR)
+- "64" → 64.0 (remise %)
+- "45" → 45.0 (remise %)
+
+VÉRIFICATION FINALE AVANT DE RETOURNER LE JSON :
+✓ quantite contient un PETIT nombre (1.0, 2.0, 2.984...) ?
+✓ prix_unitaire_brut contient un GRAND nombre (919.11, 1183.11...) ?
+✓ total_ht est INFÉRIEUR à prix_unitaire_brut (car remise appliquée) ?
+✓ unite contient du TEXTE ("PIECE", "Mètres") et pas un nombre ?
+
+Le fichier source est : {file_name}
 
 Retourne UNIQUEMENT le JSON valide sans commentaires."""
 
