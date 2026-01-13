@@ -15,15 +15,30 @@ services:
         reservations:
           memory: 4G
 
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb_server
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=documents_db
+    restart: unless-stopped
+
   pdf_processor:
     build: .
     container_name: pdf_processor
     depends_on:
       - ollama
+      - mongodb
     volumes:
       - ./input:/app/input
       - ./output:/app/output
       - ./src:/app/src
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
     environment:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - PYTHONPATH=/app
@@ -31,6 +46,9 @@ services:
       - TIMEOUT=${TIMEOUT:-600}
       - MAX_WORKERS=${MAX_WORKERS:-3}
       - POLL_INTERVAL=${POLL_INTERVAL:-10}
+      - MONGO_HOST=${MONGO_HOST:-mongodb}
+      - MONGO_PORT=${MONGO_PORT:-27017}
+      - MONGO_DB_NAME=${MONGO_DB_NAME:-documents_db}
 
     command: python src/main.py
     # Limites de ressources pour optimisation
@@ -45,3 +63,4 @@ services:
 
 volumes:
   ollama_data:
+  mongodb_data:

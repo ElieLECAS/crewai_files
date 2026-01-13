@@ -1,0 +1,345 @@
+{% extends "base.html" %}
+
+{% block title %}{{ display_name }} - Gestion Documents{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>{{ display_name }}</h1>
+        <p class="subtitle">{{ total }} document{{ 's' if total > 1 else '' }} au total</p>
+    </div>
+
+    {% if documents %}
+    <div class="filters-section">
+        <div class="filters-card">
+            <h3>Filtres</h3>
+            <div class="filters-grid">
+                <div class="filter-group">
+                    <label for="search-input">Recherche</label>
+                    <input type="text" id="search-input" class="filter-input" placeholder="Numéro de facture, devis, client...">
+                </div>
+                <div class="filter-group">
+                    <label for="date-from">Date début</label>
+                    <input type="date" id="date-from" class="filter-input">
+                </div>
+                <div class="filter-group">
+                    <label for="date-to">Date fin</label>
+                    <input type="date" id="date-to" class="filter-input">
+                </div>
+                <div class="filter-group">
+                    <label for="fournisseur-filter">Fournisseur</label>
+                    <select id="fournisseur-filter" class="filter-input">
+                        <option value="">Tous</option>
+                    </select>
+                </div>
+                {% if collection_name == "factures" or collection_name == "devis" %}
+                <div class="filter-group">
+                    <label for="client-filter">Client</label>
+                    <select id="client-filter" class="filter-input">
+                        <option value="">Tous</option>
+                    </select>
+                </div>
+                {% endif %}
+                <div class="filter-group filter-actions">
+                    <button id="apply-filters" class="btn btn-primary">Appliquer</button>
+                    <button id="reset-filters" class="btn btn-secondary">Réinitialiser</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="table-container">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Fichier source</th>
+                    <th>Fournisseur</th>
+                    {% if collection_name == "factures" %}
+                    <th>Numéro facture</th>
+                    <th>Date</th>
+                    <th>Client</th>
+                    <th>Total TTC</th>
+                    {% elif collection_name == "devis" %}
+                    <th>Numéro devis</th>
+                    <th>Date émission</th>
+                    <th>Client</th>
+                    <th>Total TTC</th>
+                    {% else %}
+                    <th>Date extraction</th>
+                    {% endif %}
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="documents-tbody">
+                {% for doc in documents %}
+                <tr data-doc-id="{{ doc._id }}">
+                    <td>{{ doc.metadata.fichier_source }}</td>
+                    <td>{{ doc.metadata.nom_fournisseur }}</td>
+                    {% if collection_name == "factures" %}
+                    <td>{{ doc.entete.numero_facture if doc.entete else '-' }}</td>
+                    <td>{{ doc.entete.date if doc.entete else '-' }}</td>
+                    <td>{{ doc.entete.client_nom if doc.entete else '-' }}</td>
+                    <td class="amount">{{ doc.entete.total_ttc if doc.entete and doc.entete.total_ttc else '-' }} €</td>
+                    {% elif collection_name == "devis" %}
+                    <td>{{ doc.entete.numero_devis if doc.entete else '-' }}</td>
+                    <td>{{ doc.entete.date_emission if doc.entete else '-' }}</td>
+                    <td>{{ doc.entete.client_nom if doc.entete else '-' }}</td>
+                    <td class="amount">{{ doc.totaux.total_ttc if doc.totaux and doc.totaux.total_ttc else '-' }} €</td>
+                    {% else %}
+                    <td>{{ doc.metadata.date_extraction[:10] if doc.metadata.date_extraction else '-' }}</td>
+                    {% endif %}
+                    <td>
+                        <a href="/documents/{{ collection_name }}/{{ doc._id }}" class="btn btn-sm btn-primary">Voir</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if total_pages > 1 %}
+    <div class="pagination">
+        {% if page > 1 %}
+        <a href="/collections/{{ collection_name }}?page={{ page - 1 }}" class="btn btn-secondary">Précédent</a>
+        {% endif %}
+        <span class="page-info">Page {{ page }} sur {{ total_pages }}</span>
+        {% if page < total_pages %}
+        <a href="/collections/{{ collection_name }}?page={{ page + 1 }}" class="btn btn-secondary">Suivant</a>
+        {% endif %}
+    </div>
+    {% endif %}
+    {% else %}
+    <div class="empty-state">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+        </svg>
+        <p>Aucun document dans cette collection</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const collectionName = '{{ collection_name }}';
+    const tbody = document.getElementById('documents-tbody');
+    const searchInput = document.getElementById('search-input');
+    const dateFrom = document.getElementById('date-from');
+    const dateTo = document.getElementById('date-to');
+    const fournisseurFilter = document.getElementById('fournisseur-filter');
+    const clientFilter = document.getElementById('client-filter');
+    const applyBtn = document.getElementById('apply-filters');
+    const resetBtn = document.getElementById('reset-filters');
+    
+    let allDocuments = [];
+    let filteredDocuments = [];
+    
+    // Charger les options de filtres depuis tous les documents
+    async function loadFilterOptions() {
+        try {
+            const response = await fetch(`/api/collections/${collectionName}?limit=10000`);
+            const data = await response.json();
+            const allDocs = data.documents || [];
+            
+            // Remplir le filtre fournisseur
+            const fournisseurs = [...new Set(allDocs.map(d => d.metadata?.nom_fournisseur).filter(Boolean))].sort();
+            fournisseurs.forEach(f => {
+                const option = document.createElement('option');
+                option.value = f;
+                option.textContent = f;
+                fournisseurFilter.appendChild(option);
+            });
+            
+            // Remplir le filtre client (si applicable)
+            if (clientFilter) {
+                const clients = [...new Set(allDocs.map(d => {
+                    if (collectionName === 'factures' || collectionName === 'devis') {
+                        return d.entete?.client_nom;
+                    }
+                    return null;
+                }).filter(Boolean))].sort();
+                clients.forEach(c => {
+                    const option = document.createElement('option');
+                    option.value = c;
+                    option.textContent = c;
+                    clientFilter.appendChild(option);
+                });
+            }
+        } catch (error) {
+            console.error('Erreur lors du chargement des options de filtres:', error);
+        }
+    }
+    
+    // Charger les documents depuis l'API avec filtres
+    async function loadDocuments() {
+        try {
+            const params = new URLSearchParams();
+            if (searchInput.value) params.set('search', searchInput.value);
+            if (dateFrom.value) params.set('date_from', dateFrom.value);
+            if (dateTo.value) params.set('date_to', dateTo.value);
+            if (fournisseurFilter.value) params.set('fournisseur', fournisseurFilter.value);
+            if (clientFilter && clientFilter.value) params.set('client', clientFilter.value);
+            params.set('limit', '1000'); // Charger beaucoup pour le filtrage côté client
+            
+            const response = await fetch(`/api/collections/${collectionName}?${params.toString()}`);
+            const data = await response.json();
+            filteredDocuments = data.documents || [];
+            
+            renderDocuments();
+        } catch (error) {
+            console.error('Erreur lors du chargement des documents:', error);
+        }
+    }
+    
+    async function applyFiltersFromURL() {
+        const params = new URLSearchParams(window.location.search);
+        const search = params.get('search');
+        const dateFromParam = params.get('date_from');
+        const dateToParam = params.get('date_to');
+        const fournisseurParam = params.get('fournisseur');
+        const clientParam = params.get('client');
+        
+        if (search) searchInput.value = search;
+        if (dateFromParam) dateFrom.value = dateFromParam;
+        if (dateToParam) dateTo.value = dateToParam;
+        if (fournisseurParam) fournisseurFilter.value = fournisseurParam;
+        if (clientParam && clientFilter) clientFilter.value = clientParam;
+        
+        await filterDocuments();
+    }
+    
+    async function filterDocuments() {
+        updateURL();
+        await loadDocuments();
+    }
+    
+    function renderDocuments() {
+        if (!tbody) return;
+        
+        tbody.innerHTML = '';
+        
+        if (filteredDocuments.length === 0) {
+            const row = tbody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 10;
+            cell.textContent = 'Aucun document ne correspond aux filtres';
+            cell.style.textAlign = 'center';
+            cell.style.padding = '2rem';
+            return;
+        }
+        
+        filteredDocuments.forEach(doc => {
+            const row = tbody.insertRow();
+            row.setAttribute('data-doc-id', doc._id);
+            
+            // Fichier source
+            const cell1 = row.insertCell();
+            cell1.textContent = doc.metadata?.fichier_source || '-';
+            
+            // Fournisseur
+            const cell2 = row.insertCell();
+            cell2.textContent = doc.metadata?.nom_fournisseur || '-';
+            
+            {% if collection_name == "factures" %}
+            // Numéro facture
+            const cell3 = row.insertCell();
+            cell3.textContent = doc.entete?.numero_facture || '-';
+            
+            // Date
+            const cell4 = row.insertCell();
+            cell4.textContent = doc.entete?.date || '-';
+            
+            // Client
+            const cell5 = row.insertCell();
+            cell5.textContent = doc.entete?.client_nom || '-';
+            
+            // Total TTC
+            const cell6 = row.insertCell();
+            cell6.className = 'amount';
+            cell6.textContent = doc.entete?.total_ttc ? doc.entete.total_ttc + ' €' : '-';
+            
+            // Actions
+            const cell7 = row.insertCell();
+            const link = document.createElement('a');
+            link.href = `/documents/${collectionName}/${doc._id}`;
+            link.className = 'btn btn-sm btn-primary';
+            link.textContent = 'Voir';
+            cell7.appendChild(link);
+            {% elif collection_name == "devis" %}
+            // Numéro devis
+            const cell3 = row.insertCell();
+            cell3.textContent = doc.entete?.numero_devis || '-';
+            
+            // Date émission
+            const cell4 = row.insertCell();
+            cell4.textContent = doc.entete?.date_emission || '-';
+            
+            // Client
+            const cell5 = row.insertCell();
+            cell5.textContent = doc.entete?.client_nom || '-';
+            
+            // Total TTC
+            const cell6 = row.insertCell();
+            cell6.className = 'amount';
+            cell6.textContent = doc.totaux?.total_ttc ? doc.totaux.total_ttc + ' €' : '-';
+            
+            // Actions
+            const cell7 = row.insertCell();
+            const link = document.createElement('a');
+            link.href = `/documents/${collectionName}/${doc._id}`;
+            link.className = 'btn btn-sm btn-primary';
+            link.textContent = 'Voir';
+            cell7.appendChild(link);
+            {% else %}
+            // Date extraction
+            const cell3 = row.insertCell();
+            cell3.textContent = doc.metadata?.date_extraction ? doc.metadata.date_extraction.substring(0, 10) : '-';
+            
+            // Actions
+            const cell4 = row.insertCell();
+            const link = document.createElement('a');
+            link.href = `/documents/${collectionName}/${doc._id}`;
+            link.className = 'btn btn-sm btn-primary';
+            link.textContent = 'Voir';
+            cell4.appendChild(link);
+            {% endif %}
+        });
+    }
+    
+    function updateURL() {
+        const params = new URLSearchParams();
+        if (searchInput.value) params.set('search', searchInput.value);
+        if (dateFrom.value) params.set('date_from', dateFrom.value);
+        if (dateTo.value) params.set('date_to', dateTo.value);
+        if (fournisseurFilter.value) params.set('fournisseur', fournisseurFilter.value);
+        if (clientFilter && clientFilter.value) params.set('client', clientFilter.value);
+        
+        const newURL = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+        window.history.pushState({}, '', newURL);
+    }
+    
+    // Event listeners
+    applyBtn.addEventListener('click', filterDocuments);
+    resetBtn.addEventListener('click', () => {
+        searchInput.value = '';
+        dateFrom.value = '';
+        dateTo.value = '';
+        fournisseurFilter.value = '';
+        if (clientFilter) clientFilter.value = '';
+        filterDocuments();
+    });
+    
+    // Recherche en temps réel avec debounce
+    let searchTimeout;
+    searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimeout);
+        searchTimeout = setTimeout(filterDocuments, 300);
+    });
+    
+    // Charger les options de filtres et appliquer les filtres depuis l'URL au démarrage
+    loadFilterOptions().then(() => {
+        applyFiltersFromURL();
+    });
+});
+</script>
+{% endblock %}

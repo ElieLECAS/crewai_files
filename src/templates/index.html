@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+
+{% block title %}Accueil - Gestion Documents{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>Tableau de bord</h1>
+        <p class="subtitle">Vue d'ensemble des documents comptables</p>
+    </div>
+
+    <div class="stats-grid">
+        {% for collection_name, stat in stats.items() %}
+        <div class="stat-card">
+            <div class="stat-icon">
+                {% if collection_name == "factures" %}
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                {% elif collection_name == "devis" %}
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                </svg>
+                {% else %}
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+                </svg>
+                {% endif %}
+            </div>
+            <div class="stat-content">
+                <h3>{{ stat.display_name }}</h3>
+                <p class="stat-number">{{ stat.count }}</p>
+                <a href="/collections/{{ collection_name }}" class="stat-link">Voir les documents →</a>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="upload-section">
+        <div class="upload-card">
+            <h2>Uploader un document PDF</h2>
+            <form id="upload-form" enctype="multipart/form-data">
+                <div class="upload-area" id="upload-area">
+                    <svg class="upload-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                    </svg>
+                    <p>Glissez-déposez un ou plusieurs fichiers PDF ici</p>
+                    <p class="upload-hint">ou cliquez pour sélectionner</p>
+                    <input type="file" id="file-input" name="files" accept=".pdf" multiple style="display: none;">
+                </div>
+                <div id="file-list" class="file-list"></div>
+                <div class="upload-actions">
+                    <button type="submit" class="btn btn-primary" id="upload-btn">
+                        <span>Traiter les documents</span>
+                    </button>
+                </div>
+                <div id="upload-status" class="upload-status"></div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Zone de suivi des tâches en arrière-plan -->
+    <div id="tasks-container" class="tasks-container" style="display: none;">
+        <div class="tasks-card">
+            <div class="tasks-header">
+                <h2>Suivi des traitements</h2>
+                <span class="tasks-count" id="tasks-count">0 en cours</span>
+            </div>
+            <div id="tasks-list" class="tasks-list">
+                <!-- Les tâches seront injectées ici par JavaScript -->
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const uploadArea = document.getElementById('upload-area');
+    const fileInput = document.getElementById('file-input');
+    const uploadForm = document.getElementById('upload-form');
+    const uploadStatus = document.getElementById('upload-status');
+    const uploadBtn = document.getElementById('upload-btn');
+
+    const fileList = document.getElementById('file-list');
+
+    // Click sur la zone d'upload
+    uploadArea.addEventListener('click', () => fileInput.click());
+
+    // Drag & drop
+    uploadArea.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        uploadArea.classList.add('dragover');
+    });
+
+    uploadArea.addEventListener('dragleave', () => {
+        uploadArea.classList.remove('dragover');
+    });
+
+    uploadArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        uploadArea.classList.remove('dragover');
+        const files = Array.from(e.dataTransfer.files).filter(f => f.type === 'application/pdf');
+        if (files.length > 0) {
+            const dataTransfer = new DataTransfer();
+            files.forEach(file => dataTransfer.items.add(file));
+            fileInput.files = dataTransfer.files;
+            updateFileList(files);
+        }
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            updateFileList(Array.from(e.target.files));
+        }
+    });
+
+    function updateFileList(files) {
+        const hint = uploadArea.querySelector('.upload-hint');
+        if (files.length === 0) {
+            hint.textContent = 'ou cliquez pour sélectionner';
+            fileList.innerHTML = '';
+        } else if (files.length === 1) {
+            hint.textContent = `Fichier sélectionné : ${files[0].name}`;
+            fileList.innerHTML = '';
+        } else {
+            hint.textContent = `${files.length} fichiers sélectionnés`;
+            fileList.innerHTML = '<div class="file-list-header">Fichiers sélectionnés :</div>' +
+                files.map((file, index) => 
+                    `<div class="file-item">
+                        <span class="file-name">${file.name}</span>
+                        <span class="file-size">(${(file.size / 1024).toFixed(1)} KB)</span>
+                    </div>`
+                ).join('');
+        }
+    }
+
+    // Soumission du formulaire
+    uploadForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        if (!fileInput.files.length) {
+            showStatus('Veuillez sélectionner au moins un fichier PDF', 'error');
+            return;
+        }
+
+        const files = Array.from(fileInput.files);
+        const formData = new FormData();
+        files.forEach(file => {
+            formData.append('files', file);
+        });
+
+        uploadBtn.disabled = true;
+        uploadBtn.innerHTML = `<span>Traitement de ${files.length} fichier(s) en cours...</span>`;
+        showStatus(`Traitement de ${files.length} fichier(s) en cours...`, 'info');
+
+        try {
+            const response = await fetch('/upload', {
+                method: 'POST',
+                body: formData
+            });
+
+            const data = await response.json();
+
+            if (data.success) {
+                const successCount = data.results ? data.results.filter(r => r.success).length : files.length;
+                const failCount = files.length - successCount;
+                let message = `✅ ${successCount} fichier(s) traité(s) avec succès`;
+                if (failCount > 0) {
+                    message += `, ${failCount} erreur(s)`;
+                }
+                showStatus(message, 'success');
+                setTimeout(() => {
+                    window.location.reload();
+                }, 3000);
+            } else {
+                showStatus(`❌ ${data.message}`, 'error');
+            }
+        } catch (error) {
+            showStatus(`❌ Erreur : ${error.message}`, 'error');
+        } finally {
+            uploadBtn.disabled = false;
+            uploadBtn.innerHTML = '<span>Traiter les documents</span>';
+        }
+    });
+
+    function showStatus(message, type) {
+        uploadStatus.textContent = message;
+        uploadStatus.className = `upload-status ${type}`;
+        uploadStatus.style.display = 'block';
+    }
+});
+</script>
+{% endblock %}

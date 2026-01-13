@@ -9,3 +9,8 @@ pytesseract
 PyPDF2
 pillow
 watchdog
+pymongo
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart

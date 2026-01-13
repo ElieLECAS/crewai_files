@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+
+{% block title %}Document - {{ document.metadata.fichier_source }}{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <a href="/collections/{{ collection_name }}" class="back-link">← Retour à {{ display_name }}</a>
+        <h1>{{ document.metadata.fichier_source }}</h1>
+    </div>
+
+    <div class="document-details">
+        <div class="detail-section">
+            <h2>Métadonnées</h2>
+            <div class="detail-grid">
+                <div class="detail-item">
+                    <label>Fournisseur</label>
+                    <span>{{ document.metadata.nom_fournisseur }}</span>
+                </div>
+                <div class="detail-item">
+                    <label>Date d'extraction</label>
+                    <span>{{ document.metadata.date_extraction[:19] if document.metadata.date_extraction else '-' }}</span>
+                </div>
+                <div class="detail-item">
+                    <label>Format export</label>
+                    <span>{{ document.metadata.format_export or '-' }}</span>
+                </div>
+            </div>
+        </div>
+
+        {% if document.entete %}
+        <div class="detail-section">
+            <h2>En-tête</h2>
+            <div class="detail-grid">
+                {% if collection_name == "factures" %}
+                    {% if document.entete.numero_facture %}
+                    <div class="detail-item">
+                        <label>Numéro facture</label>
+                        <span>{{ document.entete.numero_facture }}</span>
+                    </div>
+                    {% endif %}
+                    {% if document.entete.date %}
+                    <div class="detail-item">
+                        <label>Date</label>
+                        <span>{{ document.entete.date }}</span>
+                    </div>
+                    {% endif %}
+                    {% if document.entete.client_nom %}
+                    <div class="detail-item">
+                        <label>Client</label>
+                        <span>{{ document.entete.client_nom }}</span>
+                    </div>
+                    {% endif %}
+                    {% if document.entete.total_ttc %}
+                    <div class="detail-item">
+                        <label>Total TTC</label>
+                        <span class="amount">{{ document.entete.total_ttc }} €</span>
+                    </div>
+                    {% endif %}
+                {% elif collection_name == "devis" %}
+                    {% if document.entete.numero_devis %}
+                    <div class="detail-item">
+                        <label>Numéro devis</label>
+                        <span>{{ document.entete.numero_devis }}</span>
+                    </div>
+                    {% endif %}
+                    {% if document.entete.date_emission %}
+                    <div class="detail-item">
+                        <label>Date émission</label>
+                        <span>{{ document.entete.date_emission }}</span>
+                    </div>
+                    {% endif %}
+                    {% if document.entete.date_validite %}
+                    <div class="detail-item">
+                        <label>Date validité</label>
+                        <span>{{ document.entete.date_validite }}</span>
+                    </div>
+                    {% endif %}
+                    {% if document.entete.client_nom %}
+                    <div class="detail-item">
+                        <label>Client</label>
+                        <span>{{ document.entete.client_nom }}</span>
+                    </div>
+                    {% endif %}
+                    {% if document.entete.entreprise_nom %}
+                    <div class="detail-item">
+                        <label>Entreprise</label>
+                        <span>{{ document.entete.entreprise_nom }}</span>
+                    </div>
+                    {% endif %}
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if document.totaux and collection_name == "devis" %}
+        <div class="detail-section">
+            <h2>Totaux</h2>
+            <div class="detail-grid">
+                {% if document.totaux.total_ht %}
+                <div class="detail-item">
+                    <label>Total HT</label>
+                    <span class="amount">{{ document.totaux.total_ht }} €</span>
+                </div>
+                {% endif %}
+                {% if document.totaux.total_tva %}
+                <div class="detail-item">
+                    <label>Total TVA</label>
+                    <span class="amount">{{ document.totaux.total_tva }} €</span>
+                </div>
+                {% endif %}
+                {% if document.totaux.total_ttc %}
+                <div class="detail-item">
+                    <label>Total TTC</label>
+                    <span class="amount">{{ document.totaux.total_ttc }} €</span>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if document.lignes and collection_name == "factures" %}
+        <div class="detail-section">
+            <h2>Lignes de facturation</h2>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Référence</th>
+                            <th>Désignation</th>
+                            <th>Quantité</th>
+                            <th>Prix unitaire</th>
+                            <th>Total HT</th>
+                            <th>TVA %</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ligne in document.lignes %}
+                        <tr>
+                            <td>{{ ligne.reference or ligne.numero_commande or '-' }}</td>
+                            <td>{{ ligne.designation }}</td>
+                            <td>{{ ligne.quantite if ligne.quantite else '-' }}</td>
+                            <td class="amount">{{ ligne.prix_unitaire_brut if ligne.prix_unitaire_brut else '-' }} €</td>
+                            <td class="amount">{{ ligne.total_ht if ligne.total_ht else '-' }} €</td>
+                            <td>{{ ligne.tva_pourcentage if ligne.tva_pourcentage else '-' }}%</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if document.prestations and collection_name == "devis" %}
+        <div class="detail-section">
+            <h2>Prestations</h2>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Désignation</th>
+                            <th>Dimensions</th>
+                            <th>Quantité</th>
+                            <th>Prix unitaire</th>
+                            <th>Total HT</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for prestation in document.prestations %}
+                        <tr>
+                            <td>{{ prestation.designation }}</td>
+                            <td>{{ prestation.dimensions if prestation.dimensions else '-' }}</td>
+                            <td>{{ prestation.quantite if prestation.quantite else '-' }}</td>
+                            <td class="amount">{{ prestation.prix_unitaire_brut if prestation.prix_unitaire_brut else '-' }} €</td>
+                            <td class="amount">{{ prestation.total_ht if prestation.total_ht else '-' }} €</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if document.contenu_export_brut %}
+        <div class="detail-section">
+            <h2>Contenu export brut</h2>
+            <pre class="export-content">{{ document.contenu_export_brut }}</pre>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

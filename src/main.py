@@ -18,6 +18,7 @@ import pytesseract
 from PIL import Image
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
+from src.database import insert_document
 
 # Configuration du logging avec timestamps
 logging.basicConfig(
@@ -147,7 +148,7 @@ class AgentState(TypedDict):
     file_path: str
     file_name: str
     doc_markdown: Optional[str]
-    doc_type: Optional[str]  # "devis" ou "facture"
+    doc_type: Optional[str]  # "devis", "facture" ou "bon_livraison"
     supplier: Optional[str]   # "vitraglass", "proferm", etc.
     structured_data: Optional[dict]
     is_valid: bool
@@ -443,7 +444,7 @@ def partition_node(state: AgentState) -> AgentState:
 
 def router_node(state: AgentState) -> AgentState:
     """
-    Nœud 2 : Détecte le type de document (devis ou facture) avec Few-Shot.
+    Nœud 2 : Détecte le type de document (devis, facture ou bon_livraison) avec Few-Shot.
     """
     try:
         doc_markdown = state["doc_markdown"]
@@ -461,11 +462,12 @@ def router_node(state: AgentState) -> AgentState:
 EXEMPLES :
 - Si le document contient "FACTURE" ou "N° Facture" → Réponds "FACTURE"
 - Si le document contient "DEVIS" ou "N° Devis" → Réponds "DEVIS"
+- Si le document contient "BON DE LIVRAISON" ou "BL" ou "N° BL" → Réponds "BON_LIVRAISON"
 
 CONTENU DU DOCUMENT :
 {doc_markdown[:1000]}
 
-QUESTION : Ce document est-il un DEVIS ou une FACTURE ?
+QUESTION : Ce document est-il un DEVIS, une FACTURE ou un BON_LIVRAISON ?
 RÉPONSE (un seul mot) :"""
         
         # LLM pour la détection (sans format JSON)
@@ -483,6 +485,8 @@ RÉPONSE (un seul mot) :"""
             doc_type = "facture"
         elif "DEVIS" in doc_type:
             doc_type = "devis"
+        elif "BON_LIVRAISON" in doc_type or "BON DE LIVRAISON" in doc_type or "BL" in doc_type:
+            doc_type = "bon_livraison"
         else:
             logger.warning(f"Type non reconnu : {doc_type}, défaut : devis")
             doc_type = "devis"
@@ -913,6 +917,57 @@ def save_node(state: AgentState) -> AgentState:
         return state
 
 
+def store_db_node(state: AgentState) -> AgentState:
+    """
+    Nœud 6 : Stocke les données extraites dans la base de données MongoDB.
+    Inclut le contenu complet des fichiers CSV/JSON générés.
+    """
+    try:
+        structured_data = state.get("structured_data")
+        doc_type = state.get("doc_type")
+        supplier = state.get("supplier", "inconnu")
+        file_name = state.get("file_name", "")
+        
+        if not structured_data:
+            logger.warning("⚠️  Pas de données à stocker en BDD")
+            return state
+            
+        logger.info(f"🗄️ Stockage en BDD ({doc_type}, {supplier})")
+        
+        # Lire le contenu du fichier CSV ou JSON généré
+        contenu_fichier = None
+        type_fichier = None
+        
+        try:
+            if doc_type == "devis":
+                output_name = file_name.replace(".pdf", ".json")
+                output_path = os.path.join(OUTPUT_DIR, output_name)
+                type_fichier = "json"
+            else:  # facture ou bon_livraison
+                output_name = file_name.replace(".pdf", ".csv")
+                output_path = os.path.join(OUTPUT_DIR, output_name)
+                type_fichier = "csv"
+            
+            if os.path.exists(output_path):
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    contenu_fichier = f.read()
+                logger.info(f"✅ Contenu du fichier {type_fichier.upper()} lu ({len(contenu_fichier)} caractères)")
+            else:
+                logger.warning(f"⚠️  Fichier de sortie non trouvé : {output_path}")
+        except Exception as e:
+            logger.warning(f"⚠️  Erreur lors de la lecture du fichier de sortie : {str(e)}")
+        
+        # Appel de la fonction d'insertion avec le contenu du fichier
+        insert_document(supplier, doc_type, structured_data, contenu_fichier, type_fichier)
+        
+        return state
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du stockage en BDD : {str(e)}")
+        # On ne bloque pas le flux si le stockage échoue
+        return state
+
+
 def should_retry(state: AgentState) -> Literal["extract", "save"]:
     """
     Fonction de routage conditionnel : retry si l'extraction a échoué et retry_count < 3.
@@ -950,6 +1005,7 @@ def build_graph():
     workflow.add_node("extract", extract_node)
     workflow.add_node("validate", validate_node)
     workflow.add_node("save", save_node)
+    workflow.add_node("store_db", store_db_node)
     
     # Définir le point d'entrée
     workflow.set_entry_point("partition")
@@ -971,7 +1027,8 @@ def build_graph():
     )
     
     # Fin du graphe
-    workflow.add_edge("save", END)
+    workflow.add_edge("save", "store_db")
+    workflow.add_edge("store_db", END)
     
     return workflow.compile()
 
@@ -1257,6 +1314,18 @@ class PDFFileHandler(FileSystemEventHandler):
 # FONCTION PRINCIPALE
 # ============================================================================
 
+def start_fastapi():
+    """Démarre le serveur FastAPI dans un thread séparé."""
+    import uvicorn
+    from src.api import app as fastapi_app
+    
+    logger.info("🚀 Démarrage du serveur FastAPI sur le port 8000...")
+    try:
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, log_level="info")
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du démarrage de FastAPI : {str(e)}")
+
+
 def main():
     logger.info("=" * 60)
     logger.info(f"Démarrage avec LangGraph + PDF Native/OCR + Ministral 3B")
@@ -1266,6 +1335,12 @@ def main():
     logger.info(f"URL Ollama : {OLLAMA_BASE_URL}")
     logger.info(f"Parallélisme : {MAX_WORKERS} fichier(s) simultané(s)")
     logger.info("=" * 60)
+    
+    # Démarrer FastAPI dans un thread séparé
+    api_thread = threading.Thread(target=start_fastapi, daemon=True)
+    api_thread.start()
+    logger.info("✅ Thread FastAPI démarré")
+    logger.info("")
     
     # Construire le graphe (une seule instance partagée)
     logger.info("🔧 Construction du graphe LangGraph...")
