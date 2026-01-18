@@ -15,6 +15,46 @@
     <div class="detail-section" style="margin-bottom: 2rem;">
         <h2>Lignes de facturation agrégées</h2>
         <div class="table-container">
+            {% if supplier_id == 'vitraglass' %}
+            {# Template spécifique pour VITRAGLASS #}
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>N° Facture</th>
+                        <th>Date</th>
+                        <th>N° Commande</th>
+                        <th>Référence</th>
+                        <th>Qté</th>
+                        <th>Hauteur x Largeur</th>
+                        <th>Intercalaire</th>
+                        <th>Surface</th>
+                        <th>Prix Unitaire</th>
+                        <th>Montant</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for doc in documents.factures %}
+                        {% if doc.lignes %}
+                            {% for ligne in doc.lignes %}
+                            <tr>
+                                <td>{{ doc.entete.numero_facture or 'N/A' }}</td>
+                                <td>{{ doc.entete.date or 'N/A' }}</td>
+                                <td>{{ ligne.numero_commande or '-' }}</td>
+                                <td>{{ ligne.reference_commande or ligne.reference or '-' }}</td>
+                                <td>{{ ligne.quantite or '-' }}</td>
+                                <td>{{ ligne.hauteur_largeur or '-' }}</td>
+                                <td>{{ ligne.intercalaire or '-' }}</td>
+                                <td>{{ ligne.surface or '-' }}</td>
+                                <td class="amount">{{ ligne.prix_unitaire_brut or '-' }} €</td>
+                                <td class="amount">{{ ligne.total_ht or '-' }} €</td>
+                            </tr>
+                            {% endfor %}
+                        {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            {# Template par défaut pour SOPROFEN et autres #}
             <table class="data-table">
                 <thead>
                     <tr>
@@ -53,6 +93,7 @@
                     {% endfor %}
                 </tbody>
             </table>
+            {% endif %}
         </div>
     </div>
     {% else %}

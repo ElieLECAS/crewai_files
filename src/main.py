@@ -172,7 +172,7 @@ class AgentState(TypedDict):
 INVOICE_EXAMPLE_VITRAGLASS = """{
   "entete": {
     "numero_facture": "2025 - 37655",
-    "date": "2025-10-31",
+    "date": "31-10-2025",
     "client_nom": "PROFERM ALU",
     "total_ttc": 1206.50
   },
@@ -187,8 +187,22 @@ INVOICE_EXAMPLE_VITRAGLASS = """{
       "surface": 3.58,
       "surface_totale": 3.58,
       "quantite": 1.0,
-      "prix_unitaire_brut": 505.96,
+      "prix_unitaire_brut": 141.33,
       "total_ht": 505.96,
+      "tva_pourcentage": 20.0
+    },
+    {
+      "numero_commande": "2025 044577",
+      "bon_livraison": "2025 67804",
+      "reference_commande": "2509551.NS0",
+      "designation": "D.V. : Glace claire 6 mm + Low-e 4 mm(#3) +Gaz Argon + EMBALLAGE (MOUSSE + FILM)",
+      "hauteur_largeur": "2018 x 929",
+      "intercalaire": "14TGNO",
+      "surface": 1.88,
+      "surface_totale": 1.88,
+      "quantite": 1.0,
+      "prix_unitaire_brut": 47.40,
+      "total_ht": 89.11,
       "tva_pourcentage": 20.0
     },
     {
@@ -201,7 +215,7 @@ INVOICE_EXAMPLE_VITRAGLASS = """{
       "surface": 0.87,
       "surface_totale": 0.87,
       "quantite": 1.0,
-      "prix_unitaire_brut": 25.96,
+      "prix_unitaire_brut": 29.84,
       "total_ht": 25.96,
       "tva_pourcentage": 20.0
     }
@@ -660,10 +674,27 @@ def extract_node(state: AgentState) -> AgentState:
             if supplier == "vitraglass":
                 schema_class = VitraglassInvoiceSchema
                 example = INVOICE_EXAMPLE_VITRAGLASS
-                instr_supp = """- Extrais les numéros de commande, bons de livraison et dimensions (Hauteur x Largeur).
-- CRITIQUE : Si une commande a plusieurs pièces avec des dimensions différentes, crée UNE LIGNE SÉPARÉE par pièce.
-- Chaque ligne doit avoir des valeurs SIMPLES (pas de listes) : hauteur_largeur = "2065 x 1727" (string), pas ["2065 x 1727", "1922 x 939"].
-- Si plusieurs pièces identiques, utilise la quantité (quantite: 2.0) mais garde une seule ligne avec les mêmes dimensions."""
+                instr_supp = """- CRITIQUE : Le tableau VITRAGLASS a ces colonnes dans cet ordre :
+  COLONNE 1 : "Num" → reference ou reference_commande (numéro de ligne : 001, 002, 003...)
+  COLONNE 2 : "Qté" → quantite (toujours 1 pour les vitres individuelles)
+  COLONNE 3 : "Hauteur x Largeur" → hauteur_largeur (format: "2065 x 1727" ou "1922 x 939")
+  COLONNE 4 : "Intercalaire" → intercalaire (ex: "10TGNO", "14TGNO", "16TGNO")
+  COLONNE 5 : "Surface" → surface (surface unitaire en m², ex: 3.58, 0.87, 1.88)
+  COLONNE 6 : "Surface Totale" → surface_totale (surface totale, souvent = surface si qté=1)
+  COLONNE 7 : "Prix Unitaire" → prix_unitaire_brut (prix au m², ex: 141.33, 47.40, 29.84)
+  COLONNE 8 : "Montant" → total_ht (montant total de la ligne, ex: 505.96, 89.11, 25.96)
+
+INFORMATIONS COMPLÉMENTAIRES À EXTRAIRE :
+- numero_commande : cherche "COMMANDE NUMERO" suivi du numéro (ex: "2025 044432", "2025 582010")
+- bon_livraison : cherche "BON DE LIVRAISON :" suivi du numéro (ex: "2025 67804")
+- reference_commande : cherche "Référence :" ou "Référence cmde :" suivi de la référence
+- designation : cherche "D.V. :" suivi de la description du vitrage (ex: "D.V. : F 44/2 clair + Low-e 1.0 Advanced 6 mm(#3) +Gaz Argon")
+
+RÈGLES IMPORTANTES :
+- Chaque ligne avec un numéro (001, 002, 003...) dans la colonne "Num" est UNE LIGNE SÉPARÉE
+- Si plusieurs lignes ont la même commande, c'est normal (même numero_commande, bon_livraison)
+- IGNORE les lignes "Pièce :", "Sous total :", "Sous-total H.T. commande"
+- Convertis les nombres : "3,58" → 3.58, "141,33" → 141.33"""
             elif supplier == "soprofen":
                 # SOPROFEN utilise un format similaire à PROFERM avec références SOI
                 schema_class = ProfermInvoiceSchema

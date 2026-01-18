@@ -315,9 +315,13 @@ async def supplier_aggregated(request: Request, supplier_name: str):
     for doc_type in docs:
         docs[doc_type] = [convert_objectid(doc) for doc in docs[doc_type]]
     
+    # Convertir le nom du fournisseur en ID (minuscules, sans espaces)
+    supplier_id = supplier_name.lower().strip().replace(" ", "_")
+    
     return templates.TemplateResponse("supplier_aggregated.html", {
         "request": request,
         "supplier_name": supplier_name,
+        "supplier_id": supplier_id,
         "documents": docs
     })
 

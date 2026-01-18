@@ -129,6 +129,36 @@
             <h2>Lignes de facturation</h2>
             <div class="table-container">
                 <table class="data-table">
+                    {% if document.metadata and document.metadata.fournisseur_id == 'vitraglass' %}
+                    {# Template spécifique pour VITRAGLASS #}
+                    <thead>
+                        <tr>
+                            <th>Num</th>
+                            <th>Qté</th>
+                            <th>Hauteur x Largeur</th>
+                            <th>Intercalaire</th>
+                            <th>Surface</th>
+                            <th>Surface Totale</th>
+                            <th>Prix Unitaire</th>
+                            <th>Montant</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ligne in document.lignes %}
+                        <tr>
+                            <td>{{ ligne.reference or ligne.reference_commande or '-' }}</td>
+                            <td>{{ ligne.quantite if ligne.quantite else '-' }}</td>
+                            <td>{{ ligne.hauteur_largeur or '-' }}</td>
+                            <td>{{ ligne.intercalaire or '-' }}</td>
+                            <td>{{ ligne.surface if ligne.surface else '-' }}</td>
+                            <td>{{ ligne.surface_totale if ligne.surface_totale else '-' }}</td>
+                            <td class="amount">{{ ligne.prix_unitaire_brut if ligne.prix_unitaire_brut else '-' }} €</td>
+                            <td class="amount">{{ ligne.total_ht if ligne.total_ht else '-' }} €</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                    {% else %}
+                    {# Template par défaut pour SOPROFEN et autres #}
                     <thead>
                         <tr>
                             <th>N° de commande</th>
@@ -155,6 +185,7 @@
                         </tr>
                         {% endfor %}
                     </tbody>
+                    {% endif %}
                 </table>
             </div>
         </div>
