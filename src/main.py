@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 from typing import TypedDict, List, Optional, Annotated, Literal, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
-from langchain_ollama import ChatOllama
+from inspect import signature
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
 import PyPDF2
@@ -31,14 +32,50 @@ logger = logging.getLogger(__name__)
 # Chargement de l'environnement
 load_dotenv()
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-MODEL = os.getenv("MODEL", "mistral:3b")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = os.getenv("MODEL", "gpt5.1")
 TIMEOUT = int(os.getenv("TIMEOUT", "600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Nombre de fichiers à traiter en parallèle
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # Intervalle de polling en secondes (pour volumes Docker/Windows)
 
 # Chemins des volumes Docker
 INPUT_DIR = "/app/input"
+
+if not OPENAI_API_KEY:
+    logger.warning("⚠️ OPENAI_API_KEY non défini : les appels OpenAI échoueront tant qu'il manque dans l'environnement.")
+
+
+def make_llm(*, temperature: float = 0, force_json: bool = False) -> ChatOpenAI:
+    """
+    Crée un client LLM OpenAI (via LangChain).
+    - Le modèle est lu depuis MODEL (ex: gpt5.1)
+    - OPENAI_API_KEY doit être présent dans l'environnement
+    """
+    init_params = signature(ChatOpenAI.__init__).parameters
+    kwargs = {
+        "model": MODEL,
+        "temperature": temperature,
+    }
+
+    # Timeout selon la version de langchain-openai
+    if "timeout" in init_params:
+        kwargs["timeout"] = TIMEOUT
+    elif "request_timeout" in init_params:
+        kwargs["request_timeout"] = TIMEOUT
+
+    # Base URL optionnelle (proxies / gateways compatibles OpenAI)
+    if OPENAI_BASE_URL:
+        if "base_url" in init_params:
+            kwargs["base_url"] = OPENAI_BASE_URL
+        elif "openai_api_base" in init_params:
+            kwargs["openai_api_base"] = OPENAI_BASE_URL
+
+    # Forcer une réponse JSON si supporté par la lib (sinon, le prompt fait foi)
+    if force_json and "model_kwargs" in init_params:
+        kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+
+    return ChatOpenAI(**kwargs)
 
 
 # ============================================================================
@@ -516,12 +553,7 @@ QUESTION : Ce document est-il un DEVIS, une FACTURE ou un BON_LIVRAISON ?
 RÉPONSE (un seul mot) :"""
         
         # LLM pour la détection (sans format JSON)
-        llm = ChatOllama(
-            model=MODEL,
-            base_url=OLLAMA_BASE_URL,
-            timeout=TIMEOUT,
-            temperature=0
-        )
+        llm = make_llm(temperature=0)
         
         response = llm.invoke([HumanMessage(content=prompt)])
         doc_type = response.content.strip().upper()
@@ -584,12 +616,7 @@ CONTENU (premières lignes) :
 QUESTION : SOPROFEN est-il l'ÉMETTEUR (fournisseur) de cette facture ?
 RÉPONSE (un seul mot : oui ou non) :"""
 
-            llm = ChatOllama(
-                model=MODEL,
-                base_url=OLLAMA_BASE_URL,
-                timeout=TIMEOUT,
-                temperature=0
-            )
+            llm = make_llm(temperature=0)
             
             response = llm.invoke([HumanMessage(content=prompt)])
             is_supplier = "oui" in response.content.strip().lower()
@@ -613,12 +640,7 @@ CONTENU :
 
 RÉPONSE (un seul mot parmi : vitraglass, soprofen, inconnu) :"""
 
-        llm = ChatOllama(
-            model=MODEL,
-            base_url=OLLAMA_BASE_URL,
-            timeout=TIMEOUT,
-            temperature=0
-        )
+        llm = make_llm(temperature=0)
         
         response = llm.invoke([HumanMessage(content=prompt)])
         supplier = response.content.strip().lower()
@@ -660,14 +682,8 @@ def extract_node(state: AgentState) -> AgentState:
                 "retry_count": state.get("retry_count", 0) + 1
             }
         
-        # Créer le LLM avec structured output
-        llm = ChatOllama(
-            model=MODEL,
-            base_url=OLLAMA_BASE_URL,
-            timeout=TIMEOUT,
-            format="json",
-            temperature=0
-        )
+        # Créer le LLM (OpenAI) + structured output
+        llm = make_llm(temperature=0)
         
         # Sélection du schéma et de l'exemple selon doc_type et supplier
         if doc_type == "facture":
@@ -828,13 +844,7 @@ Retourne UNIQUEMENT le JSON sans commentaires."""
             # Essayer d'extraire le JSON directement depuis le prompt
             try:
                 # Fallback : utiliser le LLM sans structured output pour récupérer le JSON brut
-                raw_llm = ChatOllama(
-                    model=MODEL,
-                    base_url=OLLAMA_BASE_URL,
-                    timeout=TIMEOUT,
-                    format="json",
-                    temperature=0
-                )
+                raw_llm = make_llm(temperature=0, force_json=True)
                 
                 result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
                 import json
@@ -1329,10 +1339,9 @@ def start_fastapi():
 
 def main():
     logger.info("=" * 60)
-    logger.info(f"Démarrage avec LangGraph + PDF Native/OCR + Ministral 3B")
-    logger.info(f"Modèle : {MODEL}")
+    logger.info("Démarrage avec LangGraph + PDF Native/OCR + OpenAI API")
+    logger.info(f"Modèle OpenAI : {MODEL}")
     logger.info(f"Répertoire d'entrée : {INPUT_DIR}")
-    logger.info(f"URL Ollama : {OLLAMA_BASE_URL}")
     logger.info(f"Parallélisme : {MAX_WORKERS} fichier(s) simultané(s)")
     logger.info("=" * 60)
     

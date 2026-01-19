@@ -1,6 +1,7 @@
 langchain
 langchain-community
-langchain-ollama
+langchain-openai
+openai
 pydantic>=2.0.0
 python-dotenv
 langgraph
