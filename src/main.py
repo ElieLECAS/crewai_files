@@ -20,6 +20,8 @@ from PIL import Image
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from src.database import insert_document, is_document_exists
+from src.tracking import track_processing
+import tiktoken
 
 # Configuration du logging avec timestamps
 logging.basicConfig(
@@ -34,10 +36,10 @@ load_dotenv()
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("MODEL", "gpt5.1")
+MODEL = os.getenv("MODEL", "gpt-5-nano-2025-08-07")
 TIMEOUT = int(os.getenv("TIMEOUT", "600"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Nombre de fichiers à traiter en parallèle
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # Intervalle de polling en secondes (pour volumes Docker/Windows)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))  # Nombre de fichiers à traiter en parallèle (augmenté pour plus de vitesse)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))  # Intervalle de polling en secondes (réduit pour réactivité)
 
 # Chemins des volumes Docker
 INPUT_DIR = "/app/input"
@@ -200,6 +202,9 @@ class AgentState(TypedDict):
     is_valid: bool
     retry_count: int
     error_message: Optional[str]
+    tokens_input: int  # Nombre de tokens en entrée
+    tokens_output: int  # Nombre de tokens en sortie
+    page_count: int  # Nombre de pages du PDF
 
 
 # ============================================================================
@@ -490,6 +495,7 @@ def partition_node(state: AgentState) -> AgentState:
         
         # 1. Extraction native
         native_pages = extract_text_native(file_path)
+        page_count = len(native_pages)
         full_content = []
         
         for page_num, text in native_pages:
@@ -504,7 +510,7 @@ def partition_node(state: AgentState) -> AgentState:
         doc_markdown = "\n\n".join(full_content)
         
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"✅ Document analysé ({len(doc_markdown)} caractères) en {elapsed:.2f}s")
+        logger.info(f"✅ Document analysé ({len(doc_markdown)} caractères, {page_count} pages) en {elapsed:.2f}s")
         
         if not doc_markdown.strip():
             raise Exception("Le document semble vide après analyse native et OCR")
@@ -512,7 +518,10 @@ def partition_node(state: AgentState) -> AgentState:
         return {
             **state,
             "doc_markdown": doc_markdown,
-            "error_message": None
+            "page_count": page_count,
+            "error_message": None,
+            "tokens_input": 0,
+            "tokens_output": 0
         }
     
     except Exception as e:
@@ -685,6 +694,19 @@ def extract_node(state: AgentState) -> AgentState:
         # Créer le LLM (OpenAI) + structured output
         llm = make_llm(temperature=0)
         
+        # Définir l'encodage pour le comptage des tokens (une seule fois au début)
+        try:
+            if "gpt-5" in MODEL.lower() or "gpt-4" in MODEL.lower() or "gpt-3.5" in MODEL.lower():
+                try:
+                    encoding = tiktoken.encoding_for_model("gpt-4")
+                except:
+                    encoding = tiktoken.get_encoding("cl100k_base")
+            else:
+                encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur lors de l'initialisation de l'encodage : {str(e)}")
+            encoding = tiktoken.get_encoding("cl100k_base")
+        
         # Sélection du schéma et de l'exemple selon doc_type et supplier
         if doc_type == "facture":
             if supplier == "vitraglass":
@@ -805,6 +827,14 @@ INSTRUCTIONS :
 
 Retourne UNIQUEMENT le JSON sans commentaires."""
         
+        # Compter les tokens input (prompt)
+        try:
+            tokens_input = len(encoding.encode(prompt))
+            logger.debug(f"📊 Tokens input comptés : {tokens_input}")
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur lors du comptage des tokens input : {str(e)}")
+            tokens_input = 0
+        
         # Utiliser with_structured_output pour forcer le schéma Pydantic
         structured_llm = llm.with_structured_output(schema_class)
         
@@ -831,10 +861,22 @@ Retourne UNIQUEMENT le JSON sans commentaires."""
                 validated = ProfermInvoiceSchema(**structured_data)
                 structured_data = validated.model_dump()
             
+            # Compter les tokens output (réponse JSON)
+            try:
+                json_output = json.dumps(structured_data, ensure_ascii=False)
+                tokens_output = len(encoding.encode(json_output))
+                logger.debug(f"📊 Tokens output comptés : {tokens_output}")
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur lors du comptage des tokens output : {str(e)}")
+                logger.debug(f"   structured_data keys: {list(structured_data.keys()) if structured_data else 'None'}")
+                tokens_output = 0
+            
             return {
                 **state,
                 "structured_data": structured_data,
-                "error_message": None
+                "error_message": None,
+                "tokens_input": tokens_input,
+                "tokens_output": tokens_output
             }
         
         except Exception as parse_error:
@@ -847,7 +889,7 @@ Retourne UNIQUEMENT le JSON sans commentaires."""
                 raw_llm = make_llm(temperature=0, force_json=True)
                 
                 result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
-                import json
+                # json est déjà importé en haut du fichier
                 raw_data = json.loads(result_raw.content)
                 
                 # Normaliser les données
@@ -864,12 +906,23 @@ Retourne UNIQUEMENT le JSON sans commentaires."""
                 else:
                     structured_data = raw_data
                 
+                # Compter les tokens output (réponse JSON récupérée)
+                try:
+                    json_output = json.dumps(structured_data, ensure_ascii=False)
+                    tokens_output = len(encoding.encode(json_output))
+                    logger.debug(f"📊 Tokens output comptés (récupération) : {tokens_output}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Erreur lors du comptage des tokens output (récupération) : {str(e)}")
+                    tokens_output = 0
+                
                 logger.info(f"✅ Extraction récupérée après normalisation")
                 
                 return {
                     **state,
                     "structured_data": structured_data,
-                    "error_message": None
+                    "error_message": None,
+                    "tokens_input": tokens_input,
+                    "tokens_output": tokens_output
                 }
                 
             except Exception as recovery_error:
@@ -885,7 +938,9 @@ Retourne UNIQUEMENT le JSON sans commentaires."""
             **state,
             "structured_data": None,
             "error_message": f"Extraction échouée : {str(e)}",
-            "retry_count": state.get("retry_count", 0) + 1
+            "retry_count": state.get("retry_count", 0) + 1,
+            "tokens_input": state.get("tokens_input", 0),
+            "tokens_output": 0
         }
 
 
@@ -1075,7 +1130,10 @@ def process_single_file(app, pdf_path: str, file_index: int, total_files: int) -
         "structured_data": None,
         "is_valid": False,
         "retry_count": 0,
-        "error_message": None
+        "error_message": None,
+        "tokens_input": 0,
+        "tokens_output": 0,
+        "page_count": 0
     }
     
     try:
@@ -1084,11 +1142,39 @@ def process_single_file(app, pdf_path: str, file_index: int, total_files: int) -
         final_state = app.invoke(initial_state)
         elapsed = (datetime.now() - start_time).total_seconds()
         
-        if final_state.get("structured_data"):
-            logger.info(f"✅ Traitement terminé avec succès en {elapsed:.2f}s : {pdf_name}")
+        # Récupérer les statistiques
+        success = final_state.get("structured_data") is not None
+        doc_type = final_state.get("doc_type", "inconnu")
+        supplier = final_state.get("supplier", "inconnu")
+        tokens_input = final_state.get("tokens_input", 0)
+        tokens_output = final_state.get("tokens_output", 0)
+        page_count = final_state.get("page_count", 0)
+        # Gérer le cas où doc_markdown est None (fichier introuvable ou vide)
+        doc_markdown = final_state.get("doc_markdown") or ""
+        char_count = len(doc_markdown)
+        error_msg = final_state.get("error_message") if not success else None
+        
+        # Enregistrer les statistiques
+        try:
+            track_processing(
+                file_name=pdf_name,
+                doc_type=doc_type,
+                supplier=supplier,
+                success=success,
+                duration=elapsed,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                char_count=char_count,
+                page_count=page_count,
+                error_message=error_msg
+            )
+        except Exception as track_error:
+            logger.warning(f"⚠️ Erreur lors de l'enregistrement des statistiques : {str(track_error)}")
+        
+        if success:
+            logger.info(f"✅ Traitement terminé avec succès en {elapsed:.2f}s : {pdf_name} ({tokens_input + tokens_output} tokens)")
             return (pdf_name, True, elapsed, None)
         else:
-            error_msg = final_state.get("error_message", "Pas de données structurées extraites")
             logger.error(f"❌ Échec du traitement : {pdf_name}")
             logger.error(f"   Erreur : {error_msg}")
             return (pdf_name, False, elapsed, error_msg)
@@ -1099,6 +1185,24 @@ def process_single_file(app, pdf_path: str, file_index: int, total_files: int) -
         logger.error(f"❌ Erreur critique lors du traitement de {pdf_name} : {error_msg}")
         import traceback
         logger.debug(traceback.format_exc())
+        
+        # Enregistrer l'échec même en cas d'exception
+        try:
+            track_processing(
+                file_name=pdf_name,
+                doc_type="inconnu",
+                supplier="inconnu",
+                success=False,
+                duration=0,
+                tokens_input=0,
+                tokens_output=0,
+                char_count=0,
+                page_count=0,
+                error_message=error_msg
+            )
+        except:
+            pass
+        
         return (pdf_name, False, elapsed, error_msg)
 
 
@@ -1159,12 +1263,29 @@ def process_pdf_files(app, pdf_files: List[str]) -> tuple[int, int, float]:
     successful = sum(1 for _, success, _, _ in results if success)
     failed = total_files - successful
     
+    # Supprimer les fichiers traités avec succès à la fin de tout le traitement
+    # Cela évite les conflits entre workers parallèles
+    deleted_count = 0
+    for pdf_name, success, _, _ in results:
+        if success:
+            # Trouver le chemin du fichier correspondant
+            pdf_path = next((path for path in pdf_files if os.path.basename(path) == pdf_name), None)
+            if pdf_path and os.path.exists(pdf_path):
+                try:
+                    os.remove(pdf_path)
+                    deleted_count += 1
+                    logger.debug(f"🗑️ Fichier supprimé après traitement : {pdf_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Erreur lors de la suppression de {pdf_path} : {str(e)}")
+    
     logger.info("")
     logger.info("=" * 60)
     logger.info(f"✨ Traitement terminé ! {total_files} fichier(s) traité(s) en {elapsed_total:.2f}s")
     logger.info(f"   ✅ Succès : {successful}")
     if failed > 0:
         logger.info(f"   ❌ Échecs : {failed}")
+    if deleted_count > 0:
+        logger.info(f"   🗑️ Fichiers supprimés : {deleted_count}")
     logger.info(f"   ⚡ Parallélisme : {MAX_WORKERS} worker(s)")
     logger.info("=" * 60)
     
@@ -1190,7 +1311,7 @@ class PDFFileHandler(FileSystemEventHandler):
         self.pending_files = set()
         self.known_files = set()  # Cache des fichiers déjà vus (évite les doublons)
         self.debounce_timer = None
-        self.debounce_delay = 1.0  # Délai en secondes pour éviter les doublons
+        self.debounce_delay = 0.2  # Délai en secondes pour éviter les doublons (réduit pour plus de réactivité)
     
     def on_created(self, event: FileSystemEvent):
         """Appelé lorsqu'un fichier ou dossier est créé."""
@@ -1264,7 +1385,7 @@ class PDFFileHandler(FileSystemEventHandler):
                 # Vérifier que le fichier n'est plus en cours d'écriture
                 # En comparant la taille à deux moments différents (avec un petit délai)
                 size1 = os.path.getsize(file_path)
-                threading.Event().wait(0.1)  # Attendre 100ms
+                threading.Event().wait(0.05)  # Attendre 50ms (réduit pour plus de vitesse)
                 size2 = os.path.getsize(file_path)
                 
                 # Si la taille a changé, le fichier est encore en cours d'écriture

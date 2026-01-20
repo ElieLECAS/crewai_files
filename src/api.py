@@ -19,6 +19,7 @@ from src.database import (
     get_all_suppliers, 
     get_documents_by_supplier
 )
+from src.tracking import get_dashboard_stats
 from src.main import build_graph, process_single_file
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,16 @@ async def index(request: Request):
     """Page d'accueil avec vue d'ensemble."""
     stats = get_collection_stats()
     return templates.TemplateResponse("index.html", {
+        "request": request,
+        "stats": stats
+    })
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    """Page dashboard avec statistiques d'utilisation et coûts."""
+    stats = get_dashboard_stats()
+    return templates.TemplateResponse("dashboard.html", {
         "request": request,
         "stats": stats
     })
@@ -326,13 +337,23 @@ async def supplier_aggregated(request: Request, supplier_name: str):
     })
 
 
-def run_processing_task(task_id: str, file_path: str, filename: str):
+def run_processing_task(file_name: str, file_path: str, filename: str):
     """Exécute le traitement d'un fichier dans le pool d'exécuteurs."""
     global task_status
     
     try:
-        task_status[task_id]["status"] = "processing"
-        task_status[task_id]["message"] = f"Traitement de {filename} en cours..."
+        # Utiliser file_name comme clé (au lieu de task_id)
+        if file_name not in task_status:
+            task_status[file_name] = {
+                "status": "processing",
+                "file_name": file_name,
+                "message": f"Traitement de {filename} en cours...",
+                "success": None,
+                "timestamp": datetime.now()
+            }
+        else:
+            task_status[file_name]["status"] = "processing"
+            task_status[file_name]["message"] = f"Traitement de {filename} en cours..."
         
         app_langgraph = get_langgraph_app()
         
@@ -346,30 +367,32 @@ def run_processing_task(task_id: str, file_path: str, filename: str):
         )
         
         if success:
-            task_status[task_id]["status"] = "completed"
-            task_status[task_id]["success"] = True
-            task_status[task_id]["message"] = f"Fichier {filename} traité avec succès en {elapsed:.1f}s"
-            
-            # Supprimer le PDF de input après traitement réussi
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    logger.info(f"🗑️ Fichier supprimé après traitement : {file_path}")
-                except Exception as e:
-                    logger.error(f"⚠️ Erreur lors de la suppression de {file_path} : {str(e)}")
+            task_status[file_name]["status"] = "completed"
+            task_status[file_name]["success"] = True
+            task_status[file_name]["message"] = f"Fichier {filename} traité avec succès en {elapsed:.1f}s"
+            # Note: La suppression du fichier se fait à la fin du traitement complet dans process_pdf_files
         else:
-            task_status[task_id]["status"] = "failed"
-            task_status[task_id]["success"] = False
-            task_status[task_id]["message"] = f"Erreur : {error_msg or 'Inconnue'}"
+            task_status[file_name]["status"] = "failed"
+            task_status[file_name]["success"] = False
+            task_status[file_name]["message"] = f"Erreur : {error_msg or 'Inconnue'}"
             # On garde le fichier en cas d'erreur pour analyse ? 
             # L'utilisateur a dit "supprime les pdf de input une fois traités". 
             # Généralement "traité" implique un succès. Je vais le garder en cas d'échec pour l'instant.
             
     except Exception as e:
-        logger.error(f"❌ Erreur critique tâche {task_id} ({filename}) : {str(e)}")
-        task_status[task_id]["status"] = "failed"
-        task_status[task_id]["success"] = False
-        task_status[task_id]["message"] = f"Erreur critique : {str(e)}"
+        logger.error(f"❌ Erreur critique tâche {file_name} ({filename}) : {str(e)}")
+        if file_name not in task_status:
+            task_status[file_name] = {
+                "status": "failed",
+                "file_name": file_name,
+                "message": f"Erreur critique : {str(e)}",
+                "success": False,
+                "timestamp": datetime.now()
+            }
+        else:
+            task_status[file_name]["status"] = "failed"
+            task_status[file_name]["success"] = False
+            task_status[file_name]["message"] = f"Erreur critique : {str(e)}"
 
 @app.post("/upload")
 async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
@@ -399,28 +422,37 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
     response_tasks = []
     
     for file in pdf_files:
-        task_id = str(uuid.uuid4())
-        file_path = os.path.join(INPUT_DIR, file.filename)
+        file_name = file.filename
+        file_path = os.path.join(INPUT_DIR, file_name)
+        
+        # Vérifier si ce fichier est déjà en cours de traitement
+        if file_name in task_status:
+            existing_status = task_status[file_name]["status"]
+            if existing_status in ["pending", "processing"]:
+                logger.info(f"⏭️ Fichier {file_name} déjà en cours de traitement, ignoré")
+                continue
         
         # Sauvegarder le fichier immédiatement
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
+        # Utiliser file_name comme clé pour éviter les doublons
         # Initialiser le statut
-        task_status[task_id] = {
+        task_status[file_name] = {
             "status": "pending",
-            "file_name": file.filename,
+            "file_name": file_name,
             "message": "En attente de traitement...",
             "success": None,
             "timestamp": datetime.now()
         }
         
         # Lancer la tâche dans le pool via BackgroundTasks pour ne pas bloquer
-        background_tasks.add_task(executor.submit, run_processing_task, task_id, file_path, file.filename)
+        # Passer file_name au lieu de task_id
+        background_tasks.add_task(executor.submit, run_processing_task, file_name, file_path, file_name)
         
         response_tasks.append({
-            "task_id": task_id,
-            "file_name": file.filename
+            "task_id": file_name,  # Utiliser file_name comme ID
+            "file_name": file_name
         })
     
     return JSONResponse({
@@ -434,14 +466,15 @@ async def get_upload_status():
     """Récupère l'état des tâches d'upload récentes."""
     # Nettoyer les vieilles tâches (plus de 1 heure)
     now = datetime.now()
-    to_delete = [tid for tid, info in task_status.items() 
+    to_delete = [file_name for file_name, info in task_status.items() 
                  if now - info["timestamp"] > timedelta(hours=1)]
-    for tid in to_delete:
-        del task_status[tid]
+    for file_name in to_delete:
+        del task_status[file_name]
         
     # Retourner les statuts triés par timestamp décroissant
+    # Chaque fichier n'apparaît qu'une seule fois (file_name est la clé)
     sorted_tasks = sorted(
-        [{"id": tid, **info} for tid, info in task_status.items()],
+        [{"id": file_name, **info} for file_name, info in task_status.items()],
         key=lambda x: x["timestamp"],
         reverse=True
     )

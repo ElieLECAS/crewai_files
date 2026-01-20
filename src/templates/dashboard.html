@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Statistiques d'utilisation{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="page-header">
+        <h1>📊 Dashboard - Statistiques d'utilisation</h1>
+        <p class="subtitle">Analyse des coûts et performances du système d'extraction</p>
+    </div>
+
+    <!-- Statistiques globales -->
+    <div class="detail-section">
+        <h2>Vue d'ensemble</h2>
+        <div class="detail-grid" style="grid-template-columns: repeat(4, 1fr);">
+            <div class="detail-item">
+                <label>Documents traités</label>
+                <span style="font-size: 2rem; font-weight: bold; color: #3b82f6;">{{ stats.global.total_documents }}</span>
+            </div>
+            <div class="detail-item">
+                <label>Taux de succès</label>
+                <span style="font-size: 2rem; font-weight: bold; color: #10b981;">{{ stats.global.success_rate|round(1) }}%</span>
+            </div>
+            <div class="detail-item">
+                <label>Réussis</label>
+                <span style="font-size: 2rem; font-weight: bold; color: #10b981;">{{ stats.global.successful }}</span>
+            </div>
+            <div class="detail-item">
+                <label>Échecs</label>
+                <span style="font-size: 2rem; font-weight: bold; color: #ef4444;">{{ stats.global.failed }}</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Statistiques de tokens -->
+    <div class="detail-section">
+        <h2>💰 Consommation de tokens et coûts</h2>
+        <div class="detail-grid" style="grid-template-columns: repeat(3, 1fr);">
+            <div class="detail-item">
+                <label>Tokens Input (total)</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">{{ "{:,}".format(stats.tokens.total_input) }}</span>
+                <div style="margin-top: 0.5rem; font-size: 0.9rem; color: #6b7280;">
+                    Moyenne : {{ "{:,.0f}".format(stats.tokens.avg_input) }} tokens/doc
+                </div>
+            </div>
+            <div class="detail-item">
+                <label>Tokens Output (total)</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">{{ "{:,}".format(stats.tokens.total_output) }}</span>
+                <div style="margin-top: 0.5rem; font-size: 0.9rem; color: #6b7280;">
+                    Moyenne : {{ "{:,.0f}".format(stats.tokens.avg_output) }} tokens/doc
+                </div>
+            </div>
+            <div class="detail-item">
+                <label>Total tokens</label>
+                <span style="font-size: 1.5rem; font-weight: bold; color: #3b82f6;">{{ "{:,}".format(stats.tokens.total) }}</span>
+            </div>
+        </div>
+
+        <div class="detail-grid" style="grid-template-columns: repeat(4, 1fr); margin-top: 1.5rem;">
+            <div class="detail-item">
+                <label>Coût Input</label>
+                <span style="font-size: 1.2rem; font-weight: bold; color: #f59e0b;">{{ "${:.4f}".format(stats.costs.input) }}</span>
+                <div style="margin-top: 0.3rem; font-size: 0.85rem; color: #6b7280;">
+                    ({{ "${:.3f}".format(stats.costs.cost_per_1k_input) }}/1K tokens)
+                </div>
+            </div>
+            <div class="detail-item">
+                <label>Coût Output</label>
+                <span style="font-size: 1.2rem; font-weight: bold; color: #f59e0b;">{{ "${:.4f}".format(stats.costs.output) }}</span>
+                <div style="margin-top: 0.3rem; font-size: 0.85rem; color: #6b7280;">
+                    ({{ "${:.3f}".format(stats.costs.cost_per_1k_output) }}/1K tokens)
+                </div>
+            </div>
+            <div class="detail-item">
+                <label>Coût Total</label>
+                <span style="font-size: 1.5rem; font-weight: bold; color: #dc2626;">{{ "${:.4f}".format(stats.costs.total) }}</span>
+            </div>
+            <div class="detail-item">
+                <label>Coût moyen/doc</label>
+                <span style="font-size: 1.2rem; font-weight: bold;">
+                    {% if stats.global.total_documents > 0 %}
+                    {{ "${:.4f}".format(stats.costs.total / stats.global.total_documents) }}
+                    {% else %}
+                    $0.0000
+                    {% endif %}
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Statistiques de contenu -->
+    <div class="detail-section">
+        <h2>📄 Contenu extrait</h2>
+        <div class="detail-grid" style="grid-template-columns: repeat(4, 1fr);">
+            <div class="detail-item">
+                <label>Total caractères</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">{{ "{:,}".format(stats.content.total_chars) }}</span>
+            </div>
+            <div class="detail-item">
+                <label>Moyenne caractères/doc</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">{{ "{:,.0f}".format(stats.content.avg_chars) }}</span>
+            </div>
+            <div class="detail-item">
+                <label>Total pages</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">{{ stats.content.total_pages }}</span>
+            </div>
+            <div class="detail-item">
+                <label>Moyenne pages/doc</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">{{ "{:.1f}".format(stats.content.avg_pages) }}</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Performances -->
+    <div class="detail-section">
+        <h2>⚡ Performances</h2>
+        <div class="detail-grid" style="grid-template-columns: repeat(2, 1fr);">
+            <div class="detail-item">
+                <label>Durée moyenne de traitement</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">{{ "{:.2f}".format(stats.performance.avg_duration) }}s</span>
+            </div>
+            <div class="detail-item">
+                <label>Débit</label>
+                <span style="font-size: 1.5rem; font-weight: bold;">
+                    {% if stats.performance.avg_duration > 0 %}
+                    {{ "{:.1f}".format(3600 / stats.performance.avg_duration) }} docs/heure
+                    {% else %}
+                    N/A
+                    {% endif %}
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Statistiques par type de document -->
+    {% if stats.by_type %}
+    <div class="detail-section">
+        <h2>Statistiques par type de document</h2>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Nombre</th>
+                        <th>Tokens Input</th>
+                        <th>Tokens Output</th>
+                        <th>Durée moyenne</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in stats.by_type %}
+                    <tr>
+                        <td><strong>{{ item.doc_type or 'Inconnu' }}</strong></td>
+                        <td>{{ item.count }}</td>
+                        <td>{{ "{:,}".format(item.tokens_input) }}</td>
+                        <td>{{ "{:,}".format(item.tokens_output) }}</td>
+                        <td>{{ "{:.2f}".format(item.avg_duration) }}s</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Statistiques par fournisseur -->
+    {% if stats.by_supplier %}
+    <div class="detail-section">
+        <h2>Statistiques par fournisseur</h2>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Fournisseur</th>
+                        <th>Nombre</th>
+                        <th>Tokens Input</th>
+                        <th>Tokens Output</th>
+                        <th>Durée moyenne</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in stats.by_supplier %}
+                    <tr>
+                        <td><strong>{{ item.supplier or 'Inconnu' }}</strong></td>
+                        <td>{{ item.count }}</td>
+                        <td>{{ "{:,}".format(item.tokens_input) }}</td>
+                        <td>{{ "{:,}".format(item.tokens_output) }}</td>
+                        <td>{{ "{:.2f}".format(item.avg_duration) }}s</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Derniers traitements -->
+    {% if stats.recent %}
+    <div class="detail-section">
+        <h2>Derniers traitements</h2>
+        <div class="table-container">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date/Heure</th>
+                        <th>Fichier</th>
+                        <th>Type</th>
+                        <th>Fournisseur</th>
+                        <th>Statut</th>
+                        <th>Durée</th>
+                        <th>Tokens In</th>
+                        <th>Tokens Out</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in stats.recent %}
+                    <tr>
+                        <td>{{ item.timestamp.strftime('%Y-%m-%d %H:%M:%S') if item.timestamp else 'N/A' }}</td>
+                        <td>{{ item.file_name }}</td>
+                        <td>{{ item.doc_type or '-' }}</td>
+                        <td>{{ item.supplier or '-' }}</td>
+                        <td>
+                            {% if item.success %}
+                            <span style="color: #10b981; font-weight: bold;">✓ Succès</span>
+                            {% else %}
+                            <span style="color: #ef4444; font-weight: bold;">✗ Échec</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ "{:.2f}".format(item.duration) }}s</td>
+                        <td>{{ "{:,}".format(item.tokens_input) if item.tokens_input else '-' }}</td>
+                        <td>{{ "{:,}".format(item.tokens_output) if item.tokens_output else '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
