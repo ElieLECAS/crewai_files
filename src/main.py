@@ -35,6 +35,7 @@ load_dotenv()
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 MODEL = os.getenv("MODEL", "glm-ocr:q8_0")
+MODEL_EXTRACT = os.getenv("MODEL_EXTRACT") or MODEL  # Modèle pour extraction (optionnel, défaut=MODEL)
 TIMEOUT = int(os.getenv("TIMEOUT", "600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Nombre de fichiers à traiter en parallèle
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # Intervalle de polling en secondes (pour volumes Docker/Windows)
@@ -49,6 +50,12 @@ OLLAMA_LOCK = threading.Lock()
 
 # Fichiers en cours (partagé entre watcher et upload API pour éviter double traitement)
 _files_in_progress_ref: Optional[set] = None
+
+
+def is_small_vision_model(model_name: str) -> bool:
+    """Modèles 3B/vision sans format=json ni with_structured_output."""
+    m = (model_name or "").lower()
+    return "glm-ocr" in m or "deepseek-ocr" in m
 
 
 def register_file_in_progress(file_path: str) -> None:
@@ -326,6 +333,13 @@ QUOTE_EXAMPLE_OPTIMIZED = """{
   "fichier_source": "Devis D47025 - PE.pdf"
 }"""
 
+# Exemples courts pour petits modèles (deepseek-ocr, glm-ocr)
+INVOICE_EXAMPLE_VITRAGLASS_SHORT = """{"entete":{"numero_facture":"2025-37655","date":"31-10-2025","client_nom":"PROFERM ALU","total_ttc":1206.50},"lignes":[{"numero_commande":"2025 044432","bon_livraison":"2025 67804","reference_commande":"2503133.NJ0","designation":"D.V. : F 44/2 clair + Low-e 6 mm","hauteur_largeur":"2065 x 1727","intercalaire":"10TGNO","surface":3.58,"surface_totale":3.58,"quantite":1.0,"prix_unitaire_brut":141.33,"total_ht":505.96,"tva_pourcentage":20.0}],"fichier_source":"FACPDF.pdf"}"""
+
+INVOICE_EXAMPLE_PROFERM_SHORT = """{"entete":{"numero_facture":"W0848335","date":"2026-01-12","client_nom":"PROFERM","total_ttc":1143.5},"lignes":[{"reference_soi":"SOI C 25 212 001 555","designation":"Coffre Paco 1390*2100 Blanc","dimensions":"1390*2100 mm","quantite":1.0,"unite":"PIECE","prix_unitaire_brut":1183.11,"remise_pourcentage":64.0,"total_ht":425.92,"tva_pourcentage":20.0}],"fichier_source":"W0848335.pdf"}"""
+
+QUOTE_EXAMPLE_SHORT = """{"entete":{"numero_devis":"D47025","date_emission":"2025-10-24","client_nom":"LE LOFT"},"prestations":[{"designation":"Porte vitrée 2 vantaux","dimensions":"1400x2150 mm","quantite":1.0,"prix_unitaire_brut":3583.6,"total_ht":3583.6,"tva_pourcentage":20.0}],"totaux":{"total_ht":7915.62,"total_ttc":9498.74},"fichier_source":"Devis.pdf"}"""
+
 
 # ============================================================================
 # OUTILS PDF (EXTRACTEUR DE TEXTE + OCR)
@@ -379,7 +393,11 @@ def ocr_page(pdf_path: str, page_num: int) -> str:
             timeout=TIMEOUT,
             temperature=0
         )
-        prompt = "Extrais tout le texte de cette page de document, dans l'ordre. Retourne uniquement le texte brut, sans markdown."
+        # deepseek-ocr attend des prompts courts et précis (doc Ollama)
+        if "deepseek-ocr" in (MODEL or "").lower():
+            prompt = "\nExtract the text in the image."
+        else:
+            prompt = "Extrais tout le texte de cette page de document, dans l'ordre. Retourne uniquement le texte brut, sans markdown."
         msg = HumanMessage(content=[
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": image_url}}
@@ -565,8 +583,16 @@ def router_node(state: AgentState) -> AgentState:
         
         logger.info(f"🔍 Détection du type de document : {file_name}")
         logger.info("   Attente verrou Ollama…")
-        # Prompt Few-Shot pour la détection
-        prompt = f"""Tu es un expert en classification de documents financiers français.
+        # Contexte réduit pour petits modèles (deepseek-ocr, glm-ocr)
+        router_chars = 600 if is_small_vision_model(MODEL) else 1000
+        if is_small_vision_model(MODEL):
+            prompt = f"""EXEMPLES : FACTURE → "FACTURE" | DEVIS → "DEVIS" | BON DE LIVRAISON → "BON_LIVRAISON"
+CONTENU :
+{doc_markdown[:router_chars]}
+
+Type document ? (un mot) :"""
+        else:
+            prompt = f"""Tu es un expert en classification de documents financiers français.
 
 EXEMPLES :
 - Si le document contient "FACTURE" ou "N° Facture" → Réponds "FACTURE"
@@ -574,7 +600,7 @@ EXEMPLES :
 - Si le document contient "BON DE LIVRAISON" ou "BL" ou "N° BL" → Réponds "BON_LIVRAISON"
 
 CONTENU DU DOCUMENT :
-{doc_markdown[:1000]}
+{doc_markdown[:router_chars]}
 
 QUESTION : Ce document est-il un DEVIS, une FACTURE ou un BON_LIVRAISON ?
 RÉPONSE (un seul mot) :"""
@@ -634,10 +660,15 @@ def detect_supplier_node(state: AgentState) -> AgentState:
             return {**state, "supplier": "vitraglass"}
         
         # Détection SOPROFEN : chercher si SOPROFEN est l'émetteur (pas le client)
+        supplier_chars = 1500 if is_small_vision_model(MODEL) else 2000
         if "SOPROFEN" in markdown_upper[:2000]:
             # Vérifier que SOPROFEN n'est pas juste le client
             # Si SOPROFEN apparaît dans l'en-tête avec adresse, c'est l'émetteur
-            prompt = f"""Tu es un expert en analyse de factures françaises.
+            prompt = f"""SOPROFEN = émetteur (fournisseur) si en-tête avec adresse. Sinon = client.
+CONTENU :
+{doc_markdown[:supplier_chars]}
+
+SOPROFEN est-il l'ÉMETTEUR ? (oui/non) :""" if is_small_vision_model(MODEL) else f"""Tu es un expert en analyse de factures françaises.
 Analyse ce document et détermine si SOPROFEN est l'ÉMETTEUR (fournisseur) ou le CLIENT de cette facture.
 
 IMPORTANT : 
@@ -665,7 +696,12 @@ RÉPONSE (un seul mot : oui ou non) :"""
                 return {**state, "supplier": "soprofen"}
         
         # Détection par LLM pour autres cas
-        prompt = f"""Tu es un expert en analyse de factures françaises.
+        supplier_ctx = 1500 if is_small_vision_model(MODEL) else 3000
+        prompt = f"""Fournisseur émetteur (pas PROFERM=client). vitraglass/soprofen/inconnu.
+CONTENU :
+{doc_markdown[:supplier_ctx]}
+
+RÉPONSE (un mot : vitraglass, soprofen ou inconnu) :""" if is_small_vision_model(MODEL) else f"""Tu es un expert en analyse de factures françaises.
 Identifie le FOURNISSEUR ÉMETTEUR de cette facture (celui qui émet la facture, pas le client).
 
 IMPORTANT :
@@ -675,7 +711,7 @@ IMPORTANT :
 - Cherche l'entreprise dans l'en-tête (nom, adresse, SIRET)
 
 CONTENU :
-{doc_markdown[:3000]}
+{doc_markdown[:supplier_ctx]}
 
 RÉPONSE (un seul mot parmi : vitraglass, soprofen, inconnu) :"""
 
@@ -737,14 +773,19 @@ def extract_node(state: AgentState) -> AgentState:
         )
         
         # Contexte réduit pour glm-ocr (évite GGML crash sur longs prompts)
-        extract_chars = min(EXTRACT_MAX_CHARS, 2500) if "glm-ocr" in extract_model.lower() else EXTRACT_MAX_CHARS
+        # Contexte réduit pour petits modèles vision (glm-ocr, deepseek-ocr)
+        if is_small_vision_model(MODEL_EXTRACT):
+            extract_chars = min(EXTRACT_MAX_CHARS, 2000)
+        else:
+            extract_chars = EXTRACT_MAX_CHARS
         
         # Sélection du schéma et de l'exemple selon doc_type et supplier
+        use_short = is_small_vision_model(MODEL_EXTRACT)
         if doc_type == "facture":
             if supplier == "vitraglass":
                 schema_class = VitraglassInvoiceSchema
-                example = INVOICE_EXAMPLE_VITRAGLASS
-                instr_supp = """- CRITIQUE : Le tableau VITRAGLASS a ces colonnes dans cet ordre :
+                example = INVOICE_EXAMPLE_VITRAGLASS_SHORT if use_short else INVOICE_EXAMPLE_VITRAGLASS
+                instr_supp = """- Num→reference_commande, Hauteur x Largeur→hauteur_largeur, Intercalaire→intercalaire, Surface→surface, Prix Unitaire→prix_unitaire_brut, Montant→total_ht. Convertis "3,58"→3.58.""" if use_short else """- CRITIQUE : Le tableau VITRAGLASS a ces colonnes dans cet ordre :
   COLONNE 1 : "Num" → reference ou reference_commande (numéro de ligne : 001, 002, 003...)
   COLONNE 2 : "Qté" → quantite (toujours 1 pour les vitres individuelles)
   COLONNE 3 : "Hauteur x Largeur" → hauteur_largeur (format: "2065 x 1727" ou "1922 x 939")
@@ -768,8 +809,8 @@ RÈGLES IMPORTANTES :
             elif supplier == "soprofen":
                 # SOPROFEN utilise un format similaire à PROFERM avec références SOI
                 schema_class = ProfermInvoiceSchema
-                example = INVOICE_EXAMPLE_PROFERM
-                instr_supp = """- CRITIQUE : Le tableau SOPROFEN a EXACTEMENT ces colonnes dans cet ordre :
+                example = INVOICE_EXAMPLE_PROFERM_SHORT if use_short else INVOICE_EXAMPLE_PROFERM
+                instr_supp = """- reference_soi, designation, quantite, unite, prix_unitaire_brut, remise_pourcentage, total_ht. Qte=nombre, P.U. Brut>Total (remise).""" if use_short else """- CRITIQUE : Le tableau SOPROFEN a EXACTEMENT ces colonnes dans cet ordre :
   COLONNE 1 : "N° de commande" → reference_soi (ex: "SOI C 25 212 001 555")
   COLONNE 2 : "Désignation" → designation (ex: "Ligne 1 Coffre Paco Dimension Tableau (L x H mm) : 1390 * 2100 Blanc R=0.18")
   COLONNE 3 : "Qte" → quantite (NOMBRE, ex: 1,000 → 1.0 ou 2,984 → 2.984)
@@ -795,10 +836,21 @@ Extrais aussi les dimensions depuis la désignation si présentes (format "L x H
             else:
                 # Schéma par défaut pour fournisseurs inconnus
                 schema_class = ProfermInvoiceSchema
-                example = INVOICE_EXAMPLE_PROFERM
-                instr_supp = "- Utilise le schéma standard d'extraction de facture."
+                example = INVOICE_EXAMPLE_PROFERM_SHORT if use_short else INVOICE_EXAMPLE_PROFERM
+                instr_supp = "- Schéma standard facture." if use_short else "- Utilise le schéma standard d'extraction de facture."
 
-            prompt = f"""Tu es un expert en extraction de factures PDF {supplier.upper()}.
+            if use_short:
+                prompt = f"""EXEMPLE :
+{example}
+
+CONTENU :
+{doc_markdown[:extract_chars]}
+
+RÈGLES : {instr_supp}
+Fichier : {file_name}
+Retourne JSON valide uniquement."""
+            else:
+                prompt = f"""Tu es un expert en extraction de factures PDF {supplier.upper()}.
 
 IMPORTANT : Regarde attentivement l'EXEMPLE ci-dessous pour comprendre la structure exacte attendue.
 
@@ -842,8 +894,18 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
 
         else:  # devis
             schema_class = QuoteSchema
-            example = QUOTE_EXAMPLE_OPTIMIZED
-            prompt = f"""Tu es un expert en extraction de devis PDF PROFERM.
+            example = QUOTE_EXAMPLE_SHORT if use_short else QUOTE_EXAMPLE_OPTIMIZED
+            if use_short:
+                prompt = f"""EXEMPLE :
+{example}
+
+CONTENU :
+{doc_markdown[:extract_chars]}
+
+Extrais prestations, totaux. Fichier : {file_name}
+Retourne JSON valide uniquement."""
+            else:
+                prompt = f"""Tu es un expert en extraction de devis PDF PROFERM.
 
 EXEMPLE DE SORTIE ATTENDUE :
 {example}
@@ -859,12 +921,12 @@ INSTRUCTIONS :
 
 Retourne UNIQUEMENT le JSON valide sans commentaires."""
         
-        # glm-ocr crash avec with_structured_output et format=json (GGML_ASSERT) : chemin sans format uniquement
-        if "glm-ocr" in extract_model.lower():
+        # glm-ocr / deepseek-ocr : chemin sans format=json (évite crash ou mauvaise sortie)
+        if is_small_vision_model(MODEL_EXTRACT):
             with OLLAMA_LOCK:
                 try:
                     raw_llm = ChatOllama(
-                        model=MODEL,
+                        model=MODEL_EXTRACT,
                         base_url=OLLAMA_BASE_URL,
                         timeout=TIMEOUT,
                         temperature=0
@@ -881,14 +943,14 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
                         structured_data = validated.model_dump()
                     else:
                         structured_data = raw_data
-                    logger.info("✅ Extraction terminée (glm-ocr, sans format=json)")
+                    logger.info("✅ Extraction terminée (petit modèle vision, sans format=json)")
                     return {
                         **state,
                         "structured_data": structured_data,
                         "error_message": None
                     }
                 except Exception as e:
-                    logger.error(f"❌ Extraction glm-ocr échouée : {str(e)}")
+                    logger.error(f"❌ Extraction petit modèle échouée : {str(e)}")
                     return {
                         **state,
                         "structured_data": None,

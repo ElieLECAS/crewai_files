@@ -29,9 +29,11 @@ services:
     environment:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - PYTHONPATH=/app
-      - MODEL=${MODEL:-glm-ocr:q8_0}
+      - MODEL=${MODEL:-deepseek-ocr:3b}
+      - MODEL_EXTRACT=${MODEL_EXTRACT:-${MODEL}}
+      - EXTRACT_MAX_CHARS=${EXTRACT_MAX_CHARS:-2000}
       - TIMEOUT=${TIMEOUT:-600}
-      - MAX_WORKERS=${MAX_WORKERS:-3}
+      - MAX_WORKERS=${MAX_WORKERS:-1}
       - POLL_INTERVAL=${POLL_INTERVAL:-10}
       - MONGO_HOST=${MONGO_HOST:-mongodb}
       - MONGO_PORT=${MONGO_PORT:-27017}
