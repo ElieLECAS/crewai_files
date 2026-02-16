@@ -1,6 +1,9 @@
 import os
+import io
+import base64
 import glob
 import json
+import re
 import csv
 import logging
 import threading
@@ -14,7 +17,6 @@ from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, END
 import PyPDF2
 from pdf2image import convert_from_path
-import pytesseract
 from PIL import Image
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
@@ -31,14 +33,34 @@ logger = logging.getLogger(__name__)
 # Chargement de l'environnement
 load_dotenv()
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-MODEL = os.getenv("MODEL", "mistral:3b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+MODEL = os.getenv("MODEL", "glm-ocr:q8_0")
 TIMEOUT = int(os.getenv("TIMEOUT", "600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Nombre de fichiers à traiter en parallèle
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # Intervalle de polling en secondes (pour volumes Docker/Windows)
+# Limite de caractères du document envoyée à l'extraction (réduire si 500 avec glm-ocr)
+EXTRACT_MAX_CHARS = int(os.getenv("EXTRACT_MAX_CHARS", "4000"))
 
 # Chemins des volumes Docker
 INPUT_DIR = "/app/input"
+
+# Verrou pour sériaiser tous les appels Ollama (évite GGML crash avec glm-ocr en requêtes concurrentes)
+OLLAMA_LOCK = threading.Lock()
+
+# Fichiers en cours (partagé entre watcher et upload API pour éviter double traitement)
+_files_in_progress_ref: Optional[set] = None
+
+
+def register_file_in_progress(file_path: str) -> None:
+    """Marque un fichier comme en cours (upload API) pour que le watcher l'ignore."""
+    if _files_in_progress_ref is not None:
+        _files_in_progress_ref.add(os.path.abspath(file_path))
+
+
+def unregister_file_in_progress(file_path: str) -> None:
+    """Retire un fichier de la liste des en cours."""
+    if _files_in_progress_ref is not None:
+        _files_in_progress_ref.discard(os.path.abspath(file_path))
 
 
 # ============================================================================
@@ -335,25 +357,67 @@ def is_page_text_empty(text: str, threshold: int = 20) -> bool:
 
 def ocr_page(pdf_path: str, page_num: int) -> str:
     """
-    Convertit une page spécifique du PDF en image et effectue un OCR.
+    Convertit une page du PDF en image et effectue l'OCR via glm-ocr (vision LLM).
     """
     try:
-        # pdf2image utilise l'indexation 0, donc page_num - 1
         images = convert_from_path(
-            pdf_path, 
-            first_page=page_num, 
+            pdf_path,
+            first_page=page_num,
             last_page=page_num,
             fmt="jpeg"
         )
         if not images:
             return ""
-        
-        # OCR avec pytesseract (en français)
-        text = pytesseract.image_to_string(images[0], lang='fra')
-        return text
+        pil_image = images[0]
+        buf = io.BytesIO()
+        pil_image.save(buf, format="JPEG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        image_url = f"data:image/jpeg;base64,{b64}"
+        llm = ChatOllama(
+            model=MODEL,
+            base_url=OLLAMA_BASE_URL,
+            timeout=TIMEOUT,
+            temperature=0
+        )
+        prompt = "Extrais tout le texte de cette page de document, dans l'ordre. Retourne uniquement le texte brut, sans markdown."
+        msg = HumanMessage(content=[
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_url}}
+        ])
+        with OLLAMA_LOCK:
+            response = llm.invoke([msg])
+        return (response.content or "").strip()
     except Exception as e:
         logger.error(f"Erreur lors de l'OCR de la page {page_num} : {str(e)}")
         return ""
+
+# ============================================================================
+# FONCTIONS UTILITAIRES
+# ============================================================================
+
+def _extract_json_from_text(text: str) -> dict:
+    """Extrait un objet JSON du texte (bloc ```json ... ``` ou premier { ... })."""
+    if not text or not text.strip():
+        raise ValueError("Réponse vide")
+    text = text.strip()
+    # Bloc markdown ```json ... ```
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if match:
+        return json.loads(match.group(1).strip())
+    # Premier objet JSON
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("Aucun JSON trouvé dans la réponse")
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start : i + 1])
+    raise ValueError("JSON mal formé dans la réponse")
+
 
 # ============================================================================
 # FONCTIONS UTILITAIRES DE NORMALISATION
@@ -442,7 +506,7 @@ def partition_node(state: AgentState) -> AgentState:
     """
     Nœud 1 : Partitionne le PDF de manière hybride.
     1. Extrait le texte natif.
-    2. Si une page est vide/scannée, utilise l'OCR (pdf2image + pytesseract).
+    2. Si une page est vide/scannée, utilise l'OCR via glm-ocr (vision LLM).
     """
     try:
         file_path = state["file_path"]
@@ -500,7 +564,7 @@ def router_node(state: AgentState) -> AgentState:
             return {**state, "doc_type": "devis"}
         
         logger.info(f"🔍 Détection du type de document : {file_name}")
-        
+        logger.info("   Attente verrou Ollama…")
         # Prompt Few-Shot pour la détection
         prompt = f"""Tu es un expert en classification de documents financiers français.
 
@@ -515,17 +579,19 @@ CONTENU DU DOCUMENT :
 QUESTION : Ce document est-il un DEVIS, une FACTURE ou un BON_LIVRAISON ?
 RÉPONSE (un seul mot) :"""
         
-        # LLM pour la détection (sans format JSON)
+        # LLM pour la détection (sans format JSON) — un seul appel à la fois (glm-ocr)
         llm = ChatOllama(
             model=MODEL,
             base_url=OLLAMA_BASE_URL,
             timeout=TIMEOUT,
             temperature=0
         )
-        
-        response = llm.invoke([HumanMessage(content=prompt)])
-        doc_type = response.content.strip().upper()
-        
+        with OLLAMA_LOCK:
+            logger.info("   Appel Ollama (détection type)…")
+            response = llm.invoke([HumanMessage(content=prompt)])
+        doc_type = (response.content or "").strip().upper()
+        if not doc_type:
+            doc_type = "DEVIS"
         if "FACTURE" in doc_type:
             doc_type = "facture"
         elif "DEVIS" in doc_type:
@@ -590,8 +656,8 @@ RÉPONSE (un seul mot : oui ou non) :"""
                 timeout=TIMEOUT,
                 temperature=0
             )
-            
-            response = llm.invoke([HumanMessage(content=prompt)])
+            with OLLAMA_LOCK:
+                response = llm.invoke([HumanMessage(content=prompt)])
             is_supplier = "oui" in response.content.strip().lower()
             
             if is_supplier:
@@ -619,8 +685,8 @@ RÉPONSE (un seul mot parmi : vitraglass, soprofen, inconnu) :"""
             timeout=TIMEOUT,
             temperature=0
         )
-        
-        response = llm.invoke([HumanMessage(content=prompt)])
+        with OLLAMA_LOCK:
+            response = llm.invoke([HumanMessage(content=prompt)])
         supplier = response.content.strip().lower()
         
         if "vitraglass" in supplier:
@@ -650,6 +716,7 @@ def extract_node(state: AgentState) -> AgentState:
         file_name = state["file_name"]
         
         logger.info(f"🤖 Extraction des données structurées (type: {doc_type}, fournisseur: {supplier})")
+        logger.info(f"   ⏳ Extraction en cours (modèle {MODEL_EXTRACT}) — peut prendre 1 à 3 min sur CPU…")
         
         if not doc_markdown:
             logger.error("❌ Pas de contenu Markdown disponible pour l'extraction")
@@ -668,6 +735,9 @@ def extract_node(state: AgentState) -> AgentState:
             format="json",
             temperature=0
         )
+        
+        # Contexte réduit pour glm-ocr (évite GGML crash sur longs prompts)
+        extract_chars = min(EXTRACT_MAX_CHARS, 2500) if "glm-ocr" in extract_model.lower() else EXTRACT_MAX_CHARS
         
         # Sélection du schéma et de l'exemple selon doc_type et supplier
         if doc_type == "facture":
@@ -745,7 +815,7 @@ ANALYSE DE L'EXEMPLE :
 - total_ht = 425.92 (colonne "Total EUR" - PRIX FINAL APRÈS REMISE, valeur BASSE)
 
 CONTENU DU DOCUMENT (MARKDOWN) :
-{doc_markdown[:8000]}
+{doc_markdown[:extract_chars]}
 
 INSTRUCTIONS STRICTES :
 {instr_supp}
@@ -779,7 +849,7 @@ EXEMPLE DE SORTIE ATTENDUE :
 {example}
 
 CONTENU DU DOCUMENT (MARKDOWN) :
-{doc_markdown[:8000]}
+{doc_markdown[:extract_chars]}
 
 INSTRUCTIONS :
 - Extrais toutes les prestations/services du devis
@@ -787,85 +857,149 @@ INSTRUCTIONS :
 - Calcule les totaux HT, TVA et TTC
 - Le fichier source est : {file_name}
 
-Retourne UNIQUEMENT le JSON sans commentaires."""
+Retourne UNIQUEMENT le JSON valide sans commentaires."""
         
-        # Utiliser with_structured_output pour forcer le schéma Pydantic
+        # glm-ocr crash avec with_structured_output et format=json (GGML_ASSERT) : chemin sans format uniquement
+        if "glm-ocr" in extract_model.lower():
+            with OLLAMA_LOCK:
+                try:
+                    raw_llm = ChatOllama(
+                        model=MODEL,
+                        base_url=OLLAMA_BASE_URL,
+                        timeout=TIMEOUT,
+                        temperature=0
+                    )
+                    result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
+                    raw_data = _extract_json_from_text(result_raw.content or "")
+                    raw_data = normalize_extracted_data(raw_data, supplier)
+                    raw_data["fichier_source"] = file_name
+                    if supplier == "vitraglass":
+                        validated = VitraglassInvoiceSchema(**raw_data)
+                        structured_data = validated.model_dump()
+                    elif supplier == "soprofen":
+                        validated = ProfermInvoiceSchema(**raw_data)
+                        structured_data = validated.model_dump()
+                    else:
+                        structured_data = raw_data
+                    logger.info("✅ Extraction terminée (glm-ocr, sans format=json)")
+                    return {
+                        **state,
+                        "structured_data": structured_data,
+                        "error_message": None
+                    }
+                except Exception as e:
+                    logger.error(f"❌ Extraction glm-ocr échouée : {str(e)}")
+                    return {
+                        **state,
+                        "structured_data": None,
+                        "error_message": f"Extraction échouée : {str(e)}",
+                        "retry_count": state.get("retry_count", 0) + 1
+                    }
+        
+        # Chemin standard (with_structured_output + fallbacks)
         structured_llm = llm.with_structured_output(schema_class)
-        
         start_time = datetime.now()
         
-        try:
-            result = structured_llm.invoke([HumanMessage(content=prompt)])
-            elapsed = (datetime.now() - start_time).total_seconds()
-            
-            logger.info(f"✅ Extraction terminée en {elapsed:.2f}s")
-            
-            # Convertir en dict pour l'état
-            structured_data = result.model_dump()
-            structured_data["fichier_source"] = file_name
-            
-            # Normaliser les données pour corriger les erreurs de format (listes)
-            structured_data = normalize_extracted_data(structured_data, supplier)
-            
-            # Ré-validater avec le schéma après normalisation
-            if supplier == "vitraglass":
-                validated = VitraglassInvoiceSchema(**structured_data)
-                structured_data = validated.model_dump()
-            elif supplier == "soprofen":
-                validated = ProfermInvoiceSchema(**structured_data)
-                structured_data = validated.model_dump()
-            
-            return {
-                **state,
-                "structured_data": structured_data,
-                "error_message": None
-            }
-        
-        except Exception as parse_error:
-            # Si l'erreur vient de la validation Pydantic, essayer de récupérer les données brutes
-            logger.warning(f"⚠️ Erreur de validation, tentative de récupération des données brutes...")
-            
-            # Essayer d'extraire le JSON directement depuis le prompt
+        with OLLAMA_LOCK:
             try:
-                # Fallback : utiliser le LLM sans structured output pour récupérer le JSON brut
-                raw_llm = ChatOllama(
-                    model=MODEL,
-                    base_url=OLLAMA_BASE_URL,
-                    timeout=TIMEOUT,
-                    format="json",
-                    temperature=0
-                )
+                result = structured_llm.invoke([HumanMessage(content=prompt)])
+                elapsed = (datetime.now() - start_time).total_seconds()
                 
-                result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
-                import json
-                raw_data = json.loads(result_raw.content)
+                logger.info(f"✅ Extraction terminée en {elapsed:.2f}s")
                 
-                # Normaliser les données
-                raw_data = normalize_extracted_data(raw_data, supplier)
-                raw_data["fichier_source"] = file_name
+                # Convertir en dict pour l'état
+                structured_data = result.model_dump()
+                structured_data["fichier_source"] = file_name
                 
-                # Ré-essayer la validation
+                # Normaliser les données pour corriger les erreurs de format (listes)
+                structured_data = normalize_extracted_data(structured_data, supplier)
+                
+                # Ré-validater avec le schéma après normalisation
                 if supplier == "vitraglass":
-                    validated = VitraglassInvoiceSchema(**raw_data)
+                    validated = VitraglassInvoiceSchema(**structured_data)
                     structured_data = validated.model_dump()
                 elif supplier == "soprofen":
-                    validated = ProfermInvoiceSchema(**raw_data)
+                    validated = ProfermInvoiceSchema(**structured_data)
                     structured_data = validated.model_dump()
-                else:
-                    structured_data = raw_data
-                
-                logger.info(f"✅ Extraction récupérée après normalisation")
                 
                 return {
                     **state,
                     "structured_data": structured_data,
                     "error_message": None
                 }
+            
+            except Exception as parse_error:
+                # Si l'erreur vient de la validation Pydantic, essayer de récupérer les données brutes
+                logger.warning(f"⚠️ Erreur de validation, tentative de récupération des données brutes...")
                 
-            except Exception as recovery_error:
-                logger.error(f"❌ Échec de la récupération : {str(recovery_error)}")
-                raise parse_error
-    
+                # Essayer d'extraire le JSON directement depuis le prompt
+                try:
+                    # Fallback : utiliser le LLM sans structured output pour récupérer le JSON brut
+                    raw_llm = ChatOllama(
+                        model=MODEL,
+                        base_url=OLLAMA_BASE_URL,
+                        timeout=TIMEOUT,
+                        format="json",
+                        temperature=0
+                    )
+                    
+                    result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
+                    raw_data = json.loads(result_raw.content)
+                    
+                    # Normaliser les données
+                    raw_data = normalize_extracted_data(raw_data, supplier)
+                    raw_data["fichier_source"] = file_name
+                    
+                    # Ré-essayer la validation
+                    if supplier == "vitraglass":
+                        validated = VitraglassInvoiceSchema(**raw_data)
+                        structured_data = validated.model_dump()
+                    elif supplier == "soprofen":
+                        validated = ProfermInvoiceSchema(**raw_data)
+                        structured_data = validated.model_dump()
+                    else:
+                        structured_data = raw_data
+                    
+                    logger.info(f"✅ Extraction récupérée après normalisation")
+                    
+                    return {
+                        **state,
+                        "structured_data": structured_data,
+                        "error_message": None
+                    }
+                    
+                except Exception as recovery_error:
+                    # Certains modèles (ex. glm-ocr) peuvent renvoyer 500 avec format="json"
+                    logger.warning(f"⚠️ Premier fallback échoué ({recovery_error}), essai sans format=json...")
+                    try:
+                        raw_llm_no_fmt = ChatOllama(
+                            model=MODEL,
+                            base_url=OLLAMA_BASE_URL,
+                            timeout=TIMEOUT,
+                            temperature=0
+                        )
+                        result_raw = raw_llm_no_fmt.invoke([HumanMessage(content=prompt)])
+                        raw_data = _extract_json_from_text(result_raw.content or "")
+                        raw_data = normalize_extracted_data(raw_data, supplier)
+                        raw_data["fichier_source"] = file_name
+                        if supplier == "vitraglass":
+                            validated = VitraglassInvoiceSchema(**raw_data)
+                            structured_data = validated.model_dump()
+                        elif supplier == "soprofen":
+                            validated = ProfermInvoiceSchema(**raw_data)
+                            structured_data = validated.model_dump()
+                        else:
+                            structured_data = raw_data
+                        logger.info(f"✅ Extraction récupérée (sans format=json)")
+                        return {
+                            **state,
+                            "structured_data": structured_data,
+                            "error_message": None
+                        }
+                    except Exception as fallback2_error:
+                        logger.error(f"❌ Échec de la récupération : {str(fallback2_error)}")
+                        raise parse_error
+
     except Exception as e:
         logger.error(f"❌ Erreur lors de l'extraction : {str(e)}")
         import traceback
@@ -1276,8 +1410,9 @@ class PDFFileHandler(FileSystemEventHandler):
                 logger.info(f"⏭️  Fichier déjà traité, ignoré : {os.path.basename(file_path)}")
                 continue
             
-            # Vérifier si le fichier est en cours de traitement
-            if file_path in self.files_in_progress:
+            # Vérifier si le fichier est en cours (watcher ou upload API)
+            abs_path = os.path.abspath(file_path)
+            if abs_path in self.files_in_progress:
                 continue
             
             new_files.append(file_path)
@@ -1287,7 +1422,7 @@ class PDFFileHandler(FileSystemEventHandler):
         
         # Marquer les fichiers comme en cours de traitement
         for f in new_files:
-            self.files_in_progress.add(f)
+            self.files_in_progress.add(os.path.abspath(f))
         
         try:
             # Traiter les nouveaux fichiers
@@ -1305,7 +1440,7 @@ class PDFFileHandler(FileSystemEventHandler):
         finally:
             # Retirer les fichiers de l'ensemble après traitement
             for f in new_files:
-                self.files_in_progress.discard(f)
+                self.files_in_progress.discard(os.path.abspath(f))
                 # Ajouter au cache des fichiers connus
                 with self.processing_lock:
                     self.known_files.add(f)
@@ -1329,7 +1464,7 @@ def start_fastapi():
 
 def main():
     logger.info("=" * 60)
-    logger.info(f"Démarrage avec LangGraph + PDF Native/OCR + Ministral 3B")
+    logger.info(f"Démarrage avec LangGraph + PDF Native/OCR + glm-ocr")
     logger.info(f"Modèle : {MODEL}")
     logger.info(f"Répertoire d'entrée : {INPUT_DIR}")
     logger.info(f"URL Ollama : {OLLAMA_BASE_URL}")
@@ -1350,6 +1485,8 @@ def main():
     
     # Ensemble pour suivre les fichiers en cours de traitement (thread-safe)
     files_in_progress = set()
+    global _files_in_progress_ref
+    _files_in_progress_ref = files_in_progress  # partagé avec l'API upload
     
     # Créer le gestionnaire d'événements
     event_handler = PDFFileHandler(app, files_in_progress)

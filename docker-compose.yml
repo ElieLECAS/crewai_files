@@ -1,20 +1,6 @@
 version: "3.8"
 
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama_server
-    volumes:
-      - ollama_data:/root/.ollama
-    # Mode CPU uniquement (sans GPU NVIDIA pour installation légère)
-    deploy:
-      resources:
-        limits:
-          memory: 8G # Prévoyez large pour Mistral 7B (Modèle + Contexte)
-          cpus: "4.0" # Donnez plus de puissance pour le calcul des tokens
-        reservations:
-          memory: 4G
-
   mongodb:
     image: mongo:7.0
     container_name: mongodb_server
@@ -30,8 +16,9 @@ services:
     build: .
     container_name: pdf_processor
     depends_on:
-      - ollama
       - mongodb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./input:/app/input
       - ./output:/app/output
@@ -40,9 +27,9 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - PYTHONPATH=/app
-      - MODEL=${MODEL:-mistral:7b}
+      - MODEL=${MODEL:-glm-ocr:q8_0}
       - TIMEOUT=${TIMEOUT:-600}
       - MAX_WORKERS=${MAX_WORKERS:-3}
       - POLL_INTERVAL=${POLL_INTERVAL:-10}
@@ -62,5 +49,4 @@ services:
           cpus: "0.5"
 
 volumes:
-  ollama_data:
   mongodb_data:

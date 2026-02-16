@@ -19,7 +19,7 @@ from src.database import (
     get_all_suppliers, 
     get_documents_by_supplier
 )
-from src.main import build_graph, process_single_file
+from src.main import build_graph, process_single_file, register_file_in_progress, unregister_file_in_progress
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +370,8 @@ def run_processing_task(task_id: str, file_path: str, filename: str):
         task_status[task_id]["status"] = "failed"
         task_status[task_id]["success"] = False
         task_status[task_id]["message"] = f"Erreur critique : {str(e)}"
+    finally:
+        unregister_file_in_progress(file_path)
 
 @app.post("/upload")
 async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
@@ -405,6 +407,9 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
         # Sauvegarder le fichier immédiatement
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        
+        # Marquer comme en cours tout de suite (évite que le watcher le traite en parallèle)
+        register_file_in_progress(file_path)
         
         # Initialiser le statut
         task_status[task_id] = {
