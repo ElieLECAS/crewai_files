@@ -9,6 +9,7 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+input/
 
 # IDE
 .vscode/

@@ -25,27 +25,27 @@ services:
       - ./src:/app/src
       - ./data:/app/data
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"
     environment:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - PYTHONPATH=/app
-      - MODEL=${MODEL:-deepseek-ocr:3b}
+      - MODEL=${MODEL:-llama3.2:3b}
       - MODEL_EXTRACT=${MODEL_EXTRACT:-${MODEL}}
-      - EXTRACT_MAX_CHARS=${EXTRACT_MAX_CHARS:-2000}
+      - EXTRACT_MAX_CHARS=${EXTRACT_MAX_CHARS:-4000}
       - TIMEOUT=${TIMEOUT:-600}
-      - MAX_WORKERS=${MAX_WORKERS:-1}
+      - MAX_WORKERS=${MAX_WORKERS:-3}
       - POLL_INTERVAL=${POLL_INTERVAL:-10}
       - MONGO_HOST=${MONGO_HOST:-mongodb}
       - MONGO_PORT=${MONGO_PORT:-27017}
       - MONGO_DB_NAME=${MONGO_DB_NAME:-documents_db}
 
     command: python src/main.py
-    # Limites de ressources pour optimisation
+    # Limites de ressources pour optimisation CPU (modèle 3B plus léger)
     deploy:
       resources:
         limits:
           memory: 4G
-          cpus: "2"
+          cpus: "3"  # Adapté pour modèle 3B
         reservations:
           memory: 1G
           cpus: "0.5"

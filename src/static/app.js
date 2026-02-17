@@ -167,12 +167,21 @@ function initUploadSystem() {
                 setTimeout(() => {
                     refreshStats();
                 }, 1000);
+                // Arrêter le polling quand il n'y a plus de tâches actives
+                stopPolling();
             } else if (activeTasks.length > 0) {
                 isProcessing = true;
                 tasksContainer.style.display = "block";
+            } else if (activeTasks.length === 0 && !isProcessing) {
+                // Pas de tâches actives et pas en cours de traitement, arrêter le polling
+                stopPolling();
             }
+            
+            // Retourner le nombre de tâches actives pour la logique de démarrage
+            return activeTasks.length;
         } catch (error) {
             console.error("Erreur lors de la récupération des statuts:", error);
+            return 0;
         }
     }
 
@@ -225,7 +234,14 @@ function initUploadSystem() {
     function startPolling() {
         if (pollingInterval) return;
         fetchTaskStatus();
-        pollingInterval = setInterval(fetchTaskStatus, 2000);
+        pollingInterval = setInterval(fetchTaskStatus, 5000); // Polling toutes les 5 secondes
+    }
+
+    function stopPolling() {
+        if (pollingInterval) {
+            clearInterval(pollingInterval);
+            pollingInterval = null;
+        }
     }
 
     async function refreshStats() {
@@ -268,8 +284,13 @@ function initUploadSystem() {
         }
     }
 
-    // Charger les statuts au démarrage
-    startPolling();
+    // Charger les statuts une seule fois au démarrage pour vérifier s'il y a des tâches actives
+    fetchTaskStatus().then((activeCount) => {
+        // Si des tâches sont actives, démarrer le polling
+        if (activeCount > 0) {
+            startPolling();
+        }
+    });
 }
 
 function sortTable(table, columnIndex) {
