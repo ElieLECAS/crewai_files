@@ -13,13 +13,11 @@ from typing import TypedDict, List, Optional, Annotated, Literal, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
 from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 import PyPDF2
 from pdf2image import convert_from_path
 from PIL import Image
-from watchdog.observers.polling import PollingObserver as Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from src.database import insert_document, is_document_exists
 
 # Configuration du logging avec timestamps
@@ -37,10 +35,10 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:1143
 MODEL = os.getenv("MODEL", "glm-ocr:q8_0")
 MODEL_EXTRACT = os.getenv("MODEL_EXTRACT") or MODEL  # Modèle pour extraction (optionnel, défaut=MODEL)
 TIMEOUT = int(os.getenv("TIMEOUT", "600"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Nombre de fichiers à traiter en parallèle
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))  # Intervalle de polling en secondes (pour volumes Docker/Windows)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))  # Nombre de fichiers à traiter en parallèle
 # Limite de caractères du document envoyée à l'extraction (réduire si 500 avec glm-ocr)
 EXTRACT_MAX_CHARS = int(os.getenv("EXTRACT_MAX_CHARS", "4000"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 
 # Chemins des volumes Docker
 INPUT_DIR = "/app/input"
@@ -51,11 +49,33 @@ OLLAMA_LOCK = threading.Lock()
 # Fichiers en cours (partagé entre watcher et upload API pour éviter double traitement)
 _files_in_progress_ref: Optional[set] = None
 
+# Singleton ChatOllama pour éviter de recharger le modèle à chaque appel
+_llm_instances: dict = {}
 
-def is_small_vision_model(model_name: str) -> bool:
-    """Modèles 3B/vision sans format=json ni with_structured_output."""
+
+def get_llm(model: Optional[str] = None, format_json: bool = False) -> ChatOllama:
+    """Retourne une instance ChatOllama réutilisable (singleton par modèle)."""
+    global _llm_instances
+    model = model or MODEL
+    key = f"{model}:{format_json}"
+    if key not in _llm_instances:
+        kwargs = dict(
+            model=model,
+            base_url=OLLAMA_BASE_URL,
+            timeout=TIMEOUT,
+            temperature=0,
+            num_ctx=OLLAMA_NUM_CTX,
+        )
+        if format_json:
+            kwargs["format"] = "json"
+        _llm_instances[key] = ChatOllama(**kwargs)
+    return _llm_instances[key]
+
+
+def is_local_small_model(model_name: str) -> bool:
+    """Modèles vision 3B ou textuels 7B - prompts courts pour éviter surcharge contexte."""
     m = (model_name or "").lower()
-    return "glm-ocr" in m or "deepseek-ocr" in m
+    return "glm-ocr" in m or "deepseek-ocr" in m or ":7b" in m or ":3b" in m
 
 
 def register_file_in_progress(file_path: str) -> None:
@@ -187,7 +207,8 @@ class AgentState(TypedDict):
     file_name: str
     doc_markdown: Optional[str]
     doc_type: Optional[str]  # "devis", "facture" ou "bon_livraison"
-    supplier: Optional[str]   # "vitraglass", "proferm", etc.
+    supplier: Optional[str]   # "vitraglass", "soprofen", etc.
+    table_structure: Optional[dict]  # {nb_colonnes: int, has_remise: bool, format_tableau: str}
     structured_data: Optional[dict]
     is_valid: bool
     retry_count: int
@@ -387,12 +408,7 @@ def ocr_page(pdf_path: str, page_num: int) -> str:
         pil_image.save(buf, format="JPEG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
         image_url = f"data:image/jpeg;base64,{b64}"
-        llm = ChatOllama(
-            model=MODEL,
-            base_url=OLLAMA_BASE_URL,
-            timeout=TIMEOUT,
-            temperature=0
-        )
+        llm = get_llm(model=MODEL)
         # deepseek-ocr attend des prompts courts et précis (doc Ollama)
         if "deepseek-ocr" in (MODEL or "").lower():
             prompt = "\nExtract the text in the image."
@@ -412,6 +428,48 @@ def ocr_page(pdf_path: str, page_num: int) -> str:
 # ============================================================================
 # FONCTIONS UTILITAIRES
 # ============================================================================
+
+def clean_ocr_text(text: str) -> str:
+    """
+    Nettoie le texte OCR pour supprimer les caractères bruités et les séquences répétées.
+    Supprime les séquences de caractères spéciaux multiples (ex: |||||, ====) et les caractères non-ASCII problématiques.
+    """
+    if not text:
+        return text
+    
+    # Supprimer les séquences répétées de caractères spéciaux (3+ répétitions)
+    # Exemples: |||||, ====, ----, ~~~~, etc.
+    text = re.sub(r'([|=\-~_\.\+\*#]{3,})', '', text)
+    
+    # Supprimer les séquences répétées d'autres caractères spéciaux courants en OCR
+    text = re.sub(r'([^\w\s]{3,})', '', text)  # 3+ caractères non-alphanumériques consécutifs
+    
+    # Supprimer les caractères de contrôle (sauf les sauts de ligne et tabulations)
+    text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', text)
+    
+    # Supprimer les espaces multiples (garder max 2 espaces consécutifs)
+    text = re.sub(r' {3,}', '  ', text)
+    
+    # Supprimer les lignes vides multiples (garder max 2 lignes vides consécutives)
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    
+    # Nettoyer les caractères Unicode problématiques courants en OCR
+    # Remplacer certains caractères Unicode similaires par leurs équivalents ASCII
+    replacements = {
+        '\u2018': "'",  # ' (apostrophe courbe gauche)
+        '\u2019': "'",  # ' (apostrophe courbe droite)
+        '\u201C': '"',  # " (guillemet courbe gauche)
+        '\u201D': '"',  # " (guillemet courbe droit)
+        '\u2013': '-',  # – (tiret en)
+        '\u2014': '-',  # — (tiret em)
+        '\u2026': '...',  # … (points de suspension)
+        '\u00A0': ' ',  # (espace insécable)
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    
+    return text.strip()
+
 
 def _extract_json_from_text(text: str) -> dict:
     """Extrait un objet JSON du texte (bloc ```json ... ``` ou premier { ... })."""
@@ -496,6 +554,67 @@ def normalize_vitraglass_line(line: dict) -> List[dict]:
     return normalized_lines if normalized_lines else [line]
 
 
+def restructure_json_data(raw_data: dict, supplier: str, doc_type: str) -> dict:
+    """
+    Restructure le JSON si le modèle a retourné une structure plate au lieu de entete/lignes.
+    """
+    if not raw_data or not isinstance(raw_data, dict):
+        return raw_data
+    
+    # Si déjà bien structuré, retourner tel quel
+    if "entete" in raw_data and ("lignes" in raw_data or "prestations" in raw_data):
+        return raw_data
+    
+    restructured = {"fichier_source": raw_data.get("fichier_source")}
+    
+    # Champs d'en-tête (facture)
+    entete_fields = ["numero_facture", "date", "client_nom", "total_ttc"]
+    # Champs d'en-tête (devis)
+    entete_devis_fields = ["numero_devis", "date_emission", "date_validite", "entreprise_nom", "client_nom"]
+    
+    if doc_type == "facture":
+        entete = {}
+        for field in entete_fields:
+            if field in raw_data:
+                entete[field] = raw_data.pop(field)
+        restructured["entete"] = entete if entete else {"numero_facture": None, "date": None, "client_nom": None, "total_ttc": None}
+        
+        # Détecter les lignes : si on a des champs de ligne au niveau racine ou une liste
+        lignes = []
+        if "lignes" in raw_data and isinstance(raw_data["lignes"], list):
+            lignes = raw_data["lignes"]
+        elif any(field in raw_data for field in ["reference_soi", "designation", "quantite", "prix_unitaire_brut"]):
+            # Créer une ligne depuis les champs racine
+            ligne = {}
+            ligne_fields = ["reference_soi", "designation", "quantite", "unite", "prix_unitaire_brut", 
+                          "remise_pourcentage", "total_ht", "tva_pourcentage", "dimensions"]
+            for field in ligne_fields:
+                if field in raw_data:
+                    ligne[field] = raw_data.pop(field)
+            if ligne:
+                lignes = [ligne]
+        restructured["lignes"] = lignes
+    
+    elif doc_type == "devis":
+        entete = {}
+        for field in entete_devis_fields:
+            if field in raw_data:
+                entete[field] = raw_data.pop(field)
+        restructured["entete"] = entete if entete else {}
+        
+        if "prestations" in raw_data and isinstance(raw_data["prestations"], list):
+            restructured["prestations"] = raw_data["prestations"]
+        else:
+            restructured["prestations"] = []
+        
+        if "totaux" in raw_data:
+            restructured["totaux"] = raw_data["totaux"]
+        else:
+            restructured["totaux"] = {}
+    
+    return restructured
+
+
 def normalize_extracted_data(structured_data: dict, supplier: str) -> dict:
     """
     Normalise les données extraites pour corriger les erreurs de format (listes au lieu de valeurs simples).
@@ -541,9 +660,13 @@ def partition_node(state: AgentState) -> AgentState:
             if is_page_text_empty(text):
                 logger.info(f"   Page {page_num} : Pas de texte détecté, passage à l'OCR...")
                 ocr_text = ocr_page(file_path, page_num)
+                # Nettoyer le texte OCR avant de l'ajouter
+                ocr_text = clean_ocr_text(ocr_text)
                 full_content.append(f"## Page {page_num} (OCR)\n\n{ocr_text}")
             else:
                 logger.info(f"   Page {page_num} : Texte natif extrait")
+                # Nettoyer aussi le texte natif (peut contenir des artefacts)
+                text = clean_ocr_text(text)
                 full_content.append(f"## Page {page_num}\n\n{text}")
         
         doc_markdown = "\n\n".join(full_content)
@@ -569,175 +692,132 @@ def partition_node(state: AgentState) -> AgentState:
         }
 
 
-def router_node(state: AgentState) -> AgentState:
+def router_supplier_node(state: AgentState) -> AgentState:
     """
-    Nœud 2 : Détecte le type de document (devis, facture ou bon_livraison) avec Few-Shot.
+    Nœud 2 : Détecte type (devis/facture/BL) et fournisseur en un seul appel LLM.
+    Pas de règles ni fallback — tout par l'IA.
     """
     try:
         doc_markdown = state["doc_markdown"]
         file_name = state["file_name"]
         
         if not doc_markdown:
-            logger.warning("Pas de contenu à analyser pour la détection du type")
-            return {**state, "doc_type": "devis"}
+            logger.warning("Pas de contenu à analyser")
+            return {**state, "doc_type": "devis", "supplier": "inconnu", "table_structure": {"nb_colonnes": 0, "has_remise": False, "format_tableau": ""}}
         
-        logger.info(f"🔍 Détection du type de document : {file_name}")
-        logger.info("   Attente verrou Ollama…")
-        # Contexte réduit pour petits modèles (deepseek-ocr, glm-ocr)
-        router_chars = 600 if is_small_vision_model(MODEL) else 1000
-        if is_small_vision_model(MODEL):
-            prompt = f"""EXEMPLES : FACTURE → "FACTURE" | DEVIS → "DEVIS" | BON DE LIVRAISON → "BON_LIVRAISON"
+        logger.info(f"🔍 Détection type + fournisseur : {file_name}")
+        
+        ctx_chars = 2000 if is_local_small_model(MODEL) else 3000
+        prompt = f"""Tu analyses un document. Identifie TYPE, FOURNISSEUR, structure du tableau.
+
+RÈGLES FOURNISSEUR (facture uniquement) :
+- L'émetteur = l'entreprise dans l'en-tête (nom, adresse, SIRET)
+- VITRAGLASS, GROUPE DEVGLASS, CEKAL, GLASS A LIA = fournisseur vitraglass
+- SOPROFEN = fournisseur soprofen si présent en en-tête avec adresse
+- PROFERM, PROFERM ALU, PROFERM MULTITECHNIQUES = CLIENT (notre entreprise), PAS fournisseur
+- Pour devis ou bon de livraison : fournisseur = inconnu, nb_col=0, has_remise=non
+
+Pour une FACTURE : compte le nombre de colonnes du tableau principal (ex: SOPROFEN=7, VITRAGLASS=8) et indique si une colonne remise existe (oui/non).
+
 CONTENU :
-{doc_markdown[:router_chars]}
+{doc_markdown[:ctx_chars]}
 
-Type document ? (un mot) :"""
-        else:
-            prompt = f"""Tu es un expert en classification de documents financiers français.
+Réponds UNIQUEMENT au format : TYPE|FOURNISSEUR|NB_COL|HAS_REMISE
+Exemples : facture|soprofen|7|oui   facture|vitraglass|8|non   devis|inconnu|0|non
 
-EXEMPLES :
-- Si le document contient "FACTURE" ou "N° Facture" → Réponds "FACTURE"
-- Si le document contient "DEVIS" ou "N° Devis" → Réponds "DEVIS"
-- Si le document contient "BON DE LIVRAISON" ou "BL" ou "N° BL" → Réponds "BON_LIVRAISON"
-
-CONTENU DU DOCUMENT :
-{doc_markdown[:router_chars]}
-
-QUESTION : Ce document est-il un DEVIS, une FACTURE ou un BON_LIVRAISON ?
-RÉPONSE (un seul mot) :"""
+RÉPONSE :"""
         
-        # LLM pour la détection (sans format JSON) — un seul appel à la fois (glm-ocr)
-        llm = ChatOllama(
-            model=MODEL,
-            base_url=OLLAMA_BASE_URL,
-            timeout=TIMEOUT,
-            temperature=0
-        )
+        llm = get_llm(model=MODEL)
         with OLLAMA_LOCK:
-            logger.info("   Appel Ollama (détection type)…")
+            logger.info("   Appel Ollama (type + fournisseur)…")
             response = llm.invoke([HumanMessage(content=prompt)])
-        doc_type = (response.content or "").strip().upper()
-        if not doc_type:
-            doc_type = "DEVIS"
-        if "FACTURE" in doc_type:
-            doc_type = "facture"
-        elif "DEVIS" in doc_type:
-            doc_type = "devis"
-        elif "BON_LIVRAISON" in doc_type or "BON DE LIVRAISON" in doc_type or "BL" in doc_type:
-            doc_type = "bon_livraison"
+        
+        raw = (response.content or "").strip().lower()
+        doc_type = "devis"
+        supplier = "inconnu"
+        table_structure = {"nb_colonnes": 0, "has_remise": False, "format_tableau": ""}
+        
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) >= 2:
+            type_part = parts[0] or ""
+            supp_part = parts[1] or ""
+            if "facture" in type_part:
+                doc_type = "facture"
+            elif "bon" in type_part or "livraison" in type_part or "bl" in type_part:
+                doc_type = "bon_livraison"
+            elif "devis" in type_part:
+                doc_type = "devis"
+            if doc_type == "facture":
+                if "vitraglass" in supp_part:
+                    supplier = "vitraglass"
+                elif "soprofen" in supp_part:
+                    supplier = "soprofen"
+            if len(parts) >= 4 and doc_type == "facture":
+                try:
+                    nb_col = int(parts[2]) if parts[2].isdigit() else 0
+                    has_remise = "oui" in (parts[3] or "")
+                    table_structure = {
+                        "nb_colonnes": nb_col,
+                        "has_remise": has_remise,
+                        "format_tableau": f"{supplier}_{nb_col}col" if supplier != "inconnu" else ""
+                    }
+                except (ValueError, IndexError):
+                    pass
         else:
-            logger.warning(f"Type non reconnu : {doc_type}, défaut : devis")
-            doc_type = "devis"
+            if "facture" in raw:
+                doc_type = "facture"
+            elif "devis" in raw:
+                doc_type = "devis"
+            elif "bon" in raw or "livraison" in raw:
+                doc_type = "bon_livraison"
+            if doc_type == "facture":
+                if "vitraglass" in raw:
+                    supplier = "vitraglass"
+                elif "soprofen" in raw:
+                    supplier = "soprofen"
         
-        logger.info(f"✅ Type détecté : {doc_type}")
-        
-        return {**state, "doc_type": doc_type}
+        logger.info(f"✅ Type: {doc_type}, Fournisseur: {supplier}, Structure: {table_structure}")
+        return {**state, "doc_type": doc_type, "supplier": supplier, "table_structure": table_structure}
     
     except Exception as e:
-        logger.error(f"❌ Erreur lors de la détection : {str(e)}")
-        return {**state, "doc_type": "devis"}
+        logger.error(f"❌ Erreur détection : {str(e)}")
+        return {**state, "doc_type": "devis", "supplier": "inconnu", "table_structure": {"nb_colonnes": 0, "has_remise": False, "format_tableau": ""}}
 
 
-def detect_supplier_node(state: AgentState) -> AgentState:
+def reformat_markdown_node(state: AgentState) -> AgentState:
     """
-    Nœud 2.5 : Détecte le fournisseur émetteur de la facture.
-    IMPORTANT : PROFERM/SOPROFEN est notre entreprise (le client), pas un fournisseur.
+    Nœud intermédiaire : Réécrit le texte OCR bruité en tableau Markdown propre.
+    Exécuté uniquement pour factures SOPROFEN/VITRAGLASS.
     """
+    doc_markdown = state.get("doc_markdown")
+    doc_type = state.get("doc_type")
+    supplier = state.get("supplier", "inconnu")
+    
+    if not doc_markdown or doc_type != "facture" or supplier not in ("soprofen", "vitraglass"):
+        return state
+    
     try:
-        doc_markdown = state["doc_markdown"]
-        doc_type = state["doc_type"]
+        logger.info(f"📐 Reformattage Markdown (facture {supplier})...")
+        prompt = f"""Le texte ci-dessous provient d'un document scanné. Réécris-le en tableau Markdown propre :
+- Une ligne d'en-tête avec les noms de colonnes séparés par |
+- Une ligne par ligne de données, colonnes alignées
+- Garde tout le contenu, ne supprime rien
+- Corrige les décalages et caractères parasites (|, _)
+
+TEXTE :
+{doc_markdown[:3000]}"""
         
-        if doc_type != "facture" or not doc_markdown:
-            return {**state, "supplier": "inconnu"}
-        
-        logger.info("🔍 Détection du fournisseur émetteur...")
-        
-        # Vérification par règles avant d'utiliser le LLM pour plus de précision
-        markdown_upper = doc_markdown.upper()
-        
-        # Détection VITRAGLASS : chercher dans l'en-tête (premières lignes)
-        if any(keyword in markdown_upper[:2000] for keyword in ["VITRAGLASS", "GROUPE DEVGLASS", "CEKAL", "GLASS A LIA", "FABRICANT DE VITRAGE ISOLANT"]):
-            logger.info("✅ Fournisseur détecté : vitraglass (par règles)")
-            return {**state, "supplier": "vitraglass"}
-        
-        # Détection SOPROFEN : chercher si SOPROFEN est l'émetteur (pas le client)
-        supplier_chars = 1500 if is_small_vision_model(MODEL) else 2000
-        if "SOPROFEN" in markdown_upper[:2000]:
-            # Vérifier que SOPROFEN n'est pas juste le client
-            # Si SOPROFEN apparaît dans l'en-tête avec adresse, c'est l'émetteur
-            prompt = f"""SOPROFEN = émetteur (fournisseur) si en-tête avec adresse. Sinon = client.
-CONTENU :
-{doc_markdown[:supplier_chars]}
-
-SOPROFEN est-il l'ÉMETTEUR ? (oui/non) :""" if is_small_vision_model(MODEL) else f"""Tu es un expert en analyse de factures françaises.
-Analyse ce document et détermine si SOPROFEN est l'ÉMETTEUR (fournisseur) ou le CLIENT de cette facture.
-
-IMPORTANT : 
-- Si SOPROFEN est dans l'en-tête avec son adresse/coordonnées -> c'est l'émetteur (fournisseur)
-- Si SOPROFEN est mentionné comme "client" ou "destinataire" -> ce n'est PAS le fournisseur
-
-CONTENU (premières lignes) :
-{doc_markdown[:2000]}
-
-QUESTION : SOPROFEN est-il l'ÉMETTEUR (fournisseur) de cette facture ?
-RÉPONSE (un seul mot : oui ou non) :"""
-
-            llm = ChatOllama(
-                model=MODEL,
-                base_url=OLLAMA_BASE_URL,
-                timeout=TIMEOUT,
-                temperature=0
-            )
-            with OLLAMA_LOCK:
-                response = llm.invoke([HumanMessage(content=prompt)])
-            is_supplier = "oui" in response.content.strip().lower()
-            
-            if is_supplier:
-                logger.info("✅ Fournisseur détecté : soprofen")
-                return {**state, "supplier": "soprofen"}
-        
-        # Détection par LLM pour autres cas
-        supplier_ctx = 1500 if is_small_vision_model(MODEL) else 3000
-        prompt = f"""Fournisseur émetteur (pas PROFERM=client). vitraglass/soprofen/inconnu.
-CONTENU :
-{doc_markdown[:supplier_ctx]}
-
-RÉPONSE (un mot : vitraglass, soprofen ou inconnu) :""" if is_small_vision_model(MODEL) else f"""Tu es un expert en analyse de factures françaises.
-Identifie le FOURNISSEUR ÉMETTEUR de cette facture (celui qui émet la facture, pas le client).
-
-IMPORTANT :
-- PROFERM, PROFERM ALU, PROFERM MULTITECHNIQUES = CLIENT (notre entreprise), PAS un fournisseur
-- VITRAGLASS, GROUPE DEVGLASS, CEKAL, GLASS A LIA = fournisseur VITRAGLASS
-- SOPROFEN = fournisseur uniquement s'il est dans l'en-tête avec adresse
-- Cherche l'entreprise dans l'en-tête (nom, adresse, SIRET)
-
-CONTENU :
-{doc_markdown[:supplier_ctx]}
-
-RÉPONSE (un seul mot parmi : vitraglass, soprofen, inconnu) :"""
-
-        llm = ChatOllama(
-            model=MODEL,
-            base_url=OLLAMA_BASE_URL,
-            timeout=TIMEOUT,
-            temperature=0
-        )
+        llm = get_llm(model=MODEL)
         with OLLAMA_LOCK:
             response = llm.invoke([HumanMessage(content=prompt)])
-        supplier = response.content.strip().lower()
         
-        if "vitraglass" in supplier:
-            supplier = "vitraglass"
-        elif "soprofen" in supplier:
-            supplier = "soprofen"
-        else:
-            supplier = "inconnu"
-            
-        logger.info(f"✅ Fournisseur détecté : {supplier}")
-        return {**state, "supplier": supplier}
-        
+        reformed = (response.content or "").strip()
+        if reformed and len(reformed) > 50:
+            logger.info("✅ Markdown reformatté")
+            return {**state, "doc_markdown": reformed}
     except Exception as e:
-        logger.error(f"❌ Erreur lors de la détection du fournisseur : {str(e)}")
-        return {**state, "supplier": "inconnu"}
+        logger.warning(f"⚠️ Reformattage Markdown échoué : {e}, conservation du texte original")
+    return state
 
 
 def extract_node(state: AgentState) -> AgentState:
@@ -749,7 +829,12 @@ def extract_node(state: AgentState) -> AgentState:
         doc_markdown = state["doc_markdown"]
         doc_type = state["doc_type"]
         supplier = state.get("supplier", "inconnu")
+        table_structure = state.get("table_structure") or {}
         file_name = state["file_name"]
+        
+        structure_hint = ""
+        if table_structure.get("nb_colonnes") and doc_type == "facture":
+            structure_hint = f"\nStructure détectée : {table_structure.get('nb_colonnes', 0)} colonnes, remise : {'oui' if table_structure.get('has_remise') else 'non'}\n"
         
         logger.info(f"🤖 Extraction des données structurées (type: {doc_type}, fournisseur: {supplier})")
         logger.info(f"   ⏳ Extraction en cours (modèle {MODEL_EXTRACT}) — peut prendre 1 à 3 min sur CPU…")
@@ -764,27 +849,23 @@ def extract_node(state: AgentState) -> AgentState:
             }
         
         # Créer le LLM avec structured output
-        llm = ChatOllama(
-            model=MODEL,
-            base_url=OLLAMA_BASE_URL,
-            timeout=TIMEOUT,
-            format="json",
-            temperature=0
-        )
+        llm = get_llm(model=MODEL_EXTRACT, format_json=True)
         
-        # Contexte réduit pour glm-ocr (évite GGML crash sur longs prompts)
-        # Contexte réduit pour petits modèles vision (glm-ocr, deepseek-ocr)
-        if is_small_vision_model(MODEL_EXTRACT):
-            extract_chars = min(EXTRACT_MAX_CHARS, 2000)
+        # Contexte réduit pour modèles locaux (7B/3B, vision)
+        if is_local_small_model(MODEL_EXTRACT):
+            extract_chars = min(EXTRACT_MAX_CHARS, 2500)
         else:
             extract_chars = EXTRACT_MAX_CHARS
         
-        # Sélection du schéma et de l'exemple selon doc_type et supplier
-        use_short = is_small_vision_model(MODEL_EXTRACT)
+        # Sélection du schéma, exemple et System Prompt selon doc_type et supplier
+        use_short = is_local_small_model(MODEL_EXTRACT)
+        system_prompt = ""
         if doc_type == "facture":
             if supplier == "vitraglass":
                 schema_class = VitraglassInvoiceSchema
                 example = INVOICE_EXAMPLE_VITRAGLASS_SHORT if use_short else INVOICE_EXAMPLE_VITRAGLASS
+                system_prompt = """Tu es un extracteur de factures VITRAGLASS. Les dimensions "Hauteur x Largeur" sont AU MILIEU de la désignation (format "2065 x 1727").
+Extrais-les dans hauteur_largeur. La désignation complète va dans designation (D.V. : ...)."""
                 instr_supp = """- Num→reference_commande, Hauteur x Largeur→hauteur_largeur, Intercalaire→intercalaire, Surface→surface, Prix Unitaire→prix_unitaire_brut, Montant→total_ht. Convertis "3,58"→3.58.""" if use_short else """- CRITIQUE : Le tableau VITRAGLASS a ces colonnes dans cet ordre :
   COLONNE 1 : "Num" → reference ou reference_commande (numéro de ligne : 001, 002, 003...)
   COLONNE 2 : "Qté" → quantite (toujours 1 pour les vitres individuelles)
@@ -807,10 +888,32 @@ RÈGLES IMPORTANTES :
 - IGNORE les lignes "Pièce :", "Sous total :", "Sous-total H.T. commande"
 - Convertis les nombres : "3,58" → 3.58, "141,33" → 141.33"""
             elif supplier == "soprofen":
-                # SOPROFEN utilise un format similaire à PROFERM avec références SOI
                 schema_class = ProfermInvoiceSchema
                 example = INVOICE_EXAMPLE_PROFERM_SHORT if use_short else INVOICE_EXAMPLE_PROFERM
-                instr_supp = """- reference_soi, designation, quantite, unite, prix_unitaire_brut, remise_pourcentage, total_ht. Qte=nombre, P.U. Brut>Total (remise).""" if use_short else """- CRITIQUE : Le tableau SOPROFEN a EXACTEMENT ces colonnes dans cet ordre :
+                system_prompt = """Tu es un extracteur de factures SOPROFEN.
+
+ZÉRO CALCUL : NE JAMAIS calculer, recalculer ou déduire. Tu COPIES UNIQUEMENT les valeurs telles qu'elles apparaissent dans chaque colonne du document. Aucune formule, aucun calcul.
+
+ORDRE DES COLONNES (position = numéro de colonne dans le tableau) :
+1. N° de commande → reference_soi
+2. Désignation → designation
+3. Qte → quantite (nombre)
+4. Unite → unite (texte)
+5. P.U. Brut EUR → prix_unitaire_brut (copier la valeur de CETTE colonne, ex: 565,32 → 565.32)
+6. % Rem. → remise_pourcentage
+7. Total EUR → total_ht (copier la valeur de CETTE colonne, ex: 313,75 → 313.75)
+
+RÈGLE : Chaque valeur va dans son champ. La colonne 5 = prix_unitaire_brut. La colonne 7 = total_ht. Ne pas inverser.
+Exemple concret : si le document affiche P.U. Brut = 565,32 et Total EUR = 313,75 → prix_unitaire_brut=565.32, total_ht=313.75 (copier, ne pas calculer).
+
+CRITIQUE - NE PAS MÉLANGER :
+- Extrais UNIQUEMENT les lignes qui ont un "N° de commande" commençant par "SOI" (ex: SOI C 25 212 004 653).
+- IGNORE la ligne "Sous totaux :" — ses valeurs (687,36, 351,34...) sont des SOMMES. Ne les mets JAMAIS dans les lignes d'articles.
+- % Rem. = TOUJOURS un pourcentage entre 0 et 100 (ex: 44.5, 60, 64). Si tu vois 273 ou 351, c'est une ERREUR (ce sont des montants EUR, pas des %).
+- Chaque ligne d'article a ses propres valeurs : P.U. Brut, % Rem., Total EUR. Ne pas copier les sous-totaux dans les lignes.
+
+IGNORER : "Dont éco-contribution PMCB", "Sous totaux :"."""
+                instr_supp = """- ZÉRO CALCUL : copie les valeurs. Colonne 5→prix_unitaire_brut, colonne 7→total_ht. Ne pas inverser ni calculer.""" if use_short else """- ZÉRO CALCUL : copie les valeurs telles quelles. AUCUN calcul. CRITIQUE : Le tableau SOPROFEN a EXACTEMENT ces colonnes dans cet ordre :
   COLONNE 1 : "N° de commande" → reference_soi (ex: "SOI C 25 212 001 555")
   COLONNE 2 : "Désignation" → designation (ex: "Ligne 1 Coffre Paco Dimension Tableau (L x H mm) : 1390 * 2100 Blanc R=0.18")
   COLONNE 3 : "Qte" → quantite (NOMBRE, ex: 1,000 → 1.0 ou 2,984 → 2.984)
@@ -819,20 +922,22 @@ RÈGLES IMPORTANTES :
   COLONNE 6 : "% Rem." → remise_pourcentage (POURCENTAGE, ex: 64 → 64.0 ou 45 → 45.0)
   COLONNE 7 : "Total EUR" → total_ht (PRIX FINAL APRÈS REMISE, ex: 425,92 → 425.92 ou 32,68 → 32.68)
 
-RÈGLES ABSOLUES POUR ÉVITER LES ERREURS :
-- La colonne "Qte" contient toujours un NOMBRE (quantité d'unités) : 1,000 ou 2,984
-- La colonne "Unite" contient toujours un TEXTE : "PIECE" ou "Mètres" 
-- La colonne "P.U. Brut EUR" = PRIX UNITAIRE BRUT (avant remise) : toujours > 100 pour les pièces, ~20 pour les mètres
-- La colonne "Total EUR" = TOTAL APRÈS REMISE : toujours < P.U. Brut EUR (car remise appliquée)
-- SI tu vois 1183,11 dans "P.U. Brut EUR" et 425,92 dans "Total EUR" → NE LES INVERSE PAS !
-- SI tu vois 1,000 dans "Qte" → c'est la quantité (1.0), PAS le prix !
+RÈGLES ABSOLUES - AUCUN CALCUL :
+- ZÉRO CALCUL : copie les valeurs telles quelles. Ne calcule jamais total_ht à partir de prix_unitaire_brut et remise.
+- Colonne 5 "P.U. Brut EUR" → prix_unitaire_brut : copier le nombre de cette colonne (ex: 565,32 → 565.32)
+- Colonne 7 "Total EUR" → total_ht : copier le nombre de cette colonne (ex: 313,75 → 313.75)
+- NE PAS inverser : si tu vois 565,32 dans la colonne P.U. Brut et 313,75 dans Total EUR, garde-les ainsi.
+- La colonne "Qte" (1,000) = quantité, pas un prix.
 
-IGNORE complètement :
-- Les lignes "Dont éco-contribution PMCB" ou "éco-contribution"
-- Les lignes "Sous totaux :"
-- Les lignes vides
+CRITIQUE - NE PAS MÉLANGER LIGNES ET SOUS-TOTAUX :
+- Extrais UNIQUEMENT les lignes avec "N° de commande" = SOI C ... (ex: SOI C 25 212 004 653).
+- IGNORE la ligne "Sous totaux :" — 687,36 et 351,34 sont des SOMMES. Ne les mets JAMAIS dans prix_unitaire_brut ou total_ht d'une ligne d'article.
+- remise_pourcentage = TOUJOURS entre 0 et 100 (44.5, 60, 64). Jamais 273 ou 351 (ce sont des montants EUR).
+- Chaque ligne = ses propres valeurs. Ligne 1 : 492,86 / 44.5 / 273,54. Ligne 2 : 194,50 / 60 / 77,80.
 
-Extrais aussi les dimensions depuis la désignation si présentes (format "L x H mm" ou "L * H mm")"""
+IGNORE : "Dont éco-contribution PMCB", "Sous totaux :", lignes vides.
+
+Extrais les dimensions depuis la désignation (format "L x H mm" ou "L * H mm")."""
             else:
                 # Schéma par défaut pour fournisseurs inconnus
                 schema_class = ProfermInvoiceSchema
@@ -840,31 +945,32 @@ Extrais aussi les dimensions depuis la désignation si présentes (format "L x H
                 instr_supp = "- Schéma standard facture." if use_short else "- Utilise le schéma standard d'extraction de facture."
 
             if use_short:
-                prompt = f"""EXEMPLE :
+                prompt = f"""EXEMPLE (STRUCTURE OBLIGATOIRE : {{"entete": {{...}}, "lignes": [...]}}):
 {example}
-
+{structure_hint}
 CONTENU :
 {doc_markdown[:extract_chars]}
 
 RÈGLES : {instr_supp}
+STRUCTURE JSON REQUISE : {{"entete": {{"numero_facture": "...", "date": "...", "client_nom": "...", "total_ttc": ...}}, "lignes": [{{"reference_soi": "...", "designation": "...", ...}}]}}
 Fichier : {file_name}
 Retourne JSON valide uniquement."""
             else:
                 prompt = f"""Tu es un expert en extraction de factures PDF {supplier.upper()}.
+{structure_hint}
+IMPORTANT : La structure JSON DOIT être {{"entete": {{...}}, "lignes": [...]}} - JAMAIS de champs au niveau racine.
 
-IMPORTANT : Regarde attentivement l'EXEMPLE ci-dessous pour comprendre la structure exacte attendue.
-
-EXEMPLE DE SORTIE ATTENDUE (ANALYSE BIEN CHAQUE VALEUR) :
+EXEMPLE DE SORTIE ATTENDUE (STRUCTURE OBLIGATOIRE) :
 {example}
 
-ANALYSE DE L'EXEMPLE :
-- reference_soi = "SOI C 25 212 001 555" (colonne "N° de commande")
-- designation = texte complet (colonne "Désignation")
-- quantite = 1.0 (colonne "Qte" - C'EST UN NOMBRE, pas un prix !)
-- unite = "PIECE" (colonne "Unite" - C'EST DU TEXTE)
-- prix_unitaire_brut = 1183.11 (colonne "P.U. Brut EUR" - PRIX AVANT REMISE, valeur ÉLEVÉE)
-- remise_pourcentage = 64.0 (colonne "% Rem." - POURCENTAGE)
-- total_ht = 425.92 (colonne "Total EUR" - PRIX FINAL APRÈS REMISE, valeur BASSE)
+ANALYSE DE L'EXEMPLE (AUCUN CALCUL - VALEURS COPIÉES DU DOCUMENT) :
+- reference_soi = colonne 1 "N° de commande"
+- designation = colonne 2 "Désignation"
+- quantite = colonne 3 "Qte" (1,000 → 1.0)
+- unite = colonne 4 "Unite" ("PIECE")
+- prix_unitaire_brut = colonne 5 "P.U. Brut EUR" (1183,11 → 1183.11) - COPIER TEL QUEL
+- remise_pourcentage = colonne 6 "% Rem." (64 → 64.0)
+- total_ht = colonne 7 "Total EUR" (425,92 → 425.92) - COPIER TEL QUEL, NE PAS CALCULER
 
 CONTENU DU DOCUMENT (MARKDOWN) :
 {doc_markdown[:extract_chars]}
@@ -882,15 +988,14 @@ CONVERSION DES NOMBRES (TRÈS IMPORTANT) :
 - "64" → 64.0 (remise %)
 - "45" → 45.0 (remise %)
 
-VÉRIFICATION FINALE AVANT DE RETOURNER LE JSON :
-✓ quantite contient un PETIT nombre (1.0, 2.0, 2.984...) ?
-✓ prix_unitaire_brut contient un GRAND nombre (919.11, 1183.11...) ?
-✓ total_ht est INFÉRIEUR à prix_unitaire_brut (car remise appliquée) ?
-✓ unite contient du TEXTE ("PIECE", "Mètres") et pas un nombre ?
+VÉRIFICATION : as-tu COPIÉ les valeurs sans calcul ? (prix_unitaire_brut = colonne 5, total_ht = colonne 7)
 
 Le fichier source est : {file_name}
 
-Retourne UNIQUEMENT le JSON valide sans commentaires."""
+STRUCTURE JSON OBLIGATOIRE :
+{{"entete": {{"numero_facture": "...", "date": "...", "client_nom": "...", "total_ttc": ...}}, "lignes": [{{"reference_soi": "...", "designation": "...", "quantite": ..., "unite": "...", "prix_unitaire_brut": ..., "remise_pourcentage": ..., "total_ht": ..., "tva_pourcentage": ...}}]}}
+
+Retourne UNIQUEMENT le JSON valide avec cette structure exacte, sans commentaires."""
 
         else:  # devis
             schema_class = QuoteSchema
@@ -919,22 +1024,27 @@ INSTRUCTIONS :
 - Calcule les totaux HT, TVA et TTC
 - Le fichier source est : {file_name}
 
-Retourne UNIQUEMENT le JSON valide sans commentaires."""
+STRUCTURE JSON OBLIGATOIRE : {{"entete": {{...}}, "prestations": [...], "totaux": {{...}}, "fichier_source": "..."}}
+Retourne UNIQUEMENT le JSON valide avec cette structure exacte, sans commentaires."""
         
-        # glm-ocr / deepseek-ocr : chemin sans format=json (évite crash ou mauvaise sortie)
-        if is_small_vision_model(MODEL_EXTRACT):
+        # Messages pour l'appel LLM (SystemMessage si expertise fournisseur)
+        extract_messages = [HumanMessage(content=prompt)]
+        if system_prompt:
+            extract_messages = [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
+        
+        # Extraction avec format=json (grammar strict) pour garantir JSON valide même sous charge CPU
+        if is_local_small_model(MODEL_EXTRACT):
             with OLLAMA_LOCK:
                 try:
-                    raw_llm = ChatOllama(
-                        model=MODEL_EXTRACT,
-                        base_url=OLLAMA_BASE_URL,
-                        timeout=TIMEOUT,
-                        temperature=0
-                    )
-                    result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
+                    raw_llm = get_llm(model=MODEL_EXTRACT, format_json=True)
+                    result_raw = raw_llm.invoke(extract_messages)
                     raw_data = _extract_json_from_text(result_raw.content or "")
-                    raw_data = normalize_extracted_data(raw_data, supplier)
+                    
+                    # Restructurer si nécessaire (le modèle peut retourner une structure plate)
+                    raw_data = restructure_json_data(raw_data, supplier, doc_type)
                     raw_data["fichier_source"] = file_name
+                    raw_data = normalize_extracted_data(raw_data, supplier)
+                    
                     if supplier == "vitraglass":
                         validated = VitraglassInvoiceSchema(**raw_data)
                         structured_data = validated.model_dump()
@@ -943,7 +1053,7 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
                         structured_data = validated.model_dump()
                     else:
                         structured_data = raw_data
-                    logger.info("✅ Extraction terminée (petit modèle vision, sans format=json)")
+                    logger.info("✅ Extraction terminée (format=json)")
                     return {
                         **state,
                         "structured_data": structured_data,
@@ -951,6 +1061,7 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
                     }
                 except Exception as e:
                     logger.error(f"❌ Extraction petit modèle échouée : {str(e)}")
+                    logger.debug(f"   JSON brut reçu : {result_raw.content[:500] if 'result_raw' in locals() else 'N/A'}")
                     return {
                         **state,
                         "structured_data": None,
@@ -964,7 +1075,7 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
         
         with OLLAMA_LOCK:
             try:
-                result = structured_llm.invoke([HumanMessage(content=prompt)])
+                result = structured_llm.invoke(extract_messages)
                 elapsed = (datetime.now() - start_time).total_seconds()
                 
                 logger.info(f"✅ Extraction terminée en {elapsed:.2f}s")
@@ -997,20 +1108,14 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
                 # Essayer d'extraire le JSON directement depuis le prompt
                 try:
                     # Fallback : utiliser le LLM sans structured output pour récupérer le JSON brut
-                    raw_llm = ChatOllama(
-                        model=MODEL,
-                        base_url=OLLAMA_BASE_URL,
-                        timeout=TIMEOUT,
-                        format="json",
-                        temperature=0
-                    )
+                    raw_llm = get_llm(model=MODEL, format_json=True)
+                    result_raw = raw_llm.invoke(extract_messages)
+                    raw_data = _extract_json_from_text(result_raw.content or "")
                     
-                    result_raw = raw_llm.invoke([HumanMessage(content=prompt)])
-                    raw_data = json.loads(result_raw.content)
-                    
-                    # Normaliser les données
-                    raw_data = normalize_extracted_data(raw_data, supplier)
+                    # Restructurer si nécessaire
+                    raw_data = restructure_json_data(raw_data, supplier, doc_type)
                     raw_data["fichier_source"] = file_name
+                    raw_data = normalize_extracted_data(raw_data, supplier)
                     
                     # Ré-essayer la validation
                     if supplier == "vitraglass":
@@ -1034,16 +1139,14 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
                     # Certains modèles (ex. glm-ocr) peuvent renvoyer 500 avec format="json"
                     logger.warning(f"⚠️ Premier fallback échoué ({recovery_error}), essai sans format=json...")
                     try:
-                        raw_llm_no_fmt = ChatOllama(
-                            model=MODEL,
-                            base_url=OLLAMA_BASE_URL,
-                            timeout=TIMEOUT,
-                            temperature=0
-                        )
-                        result_raw = raw_llm_no_fmt.invoke([HumanMessage(content=prompt)])
+                        raw_llm_no_fmt = get_llm(model=MODEL)
+                        result_raw = raw_llm_no_fmt.invoke(extract_messages)
                         raw_data = _extract_json_from_text(result_raw.content or "")
-                        raw_data = normalize_extracted_data(raw_data, supplier)
+                        
+                        # Restructurer si nécessaire
+                        raw_data = restructure_json_data(raw_data, supplier, doc_type)
                         raw_data["fichier_source"] = file_name
+                        raw_data = normalize_extracted_data(raw_data, supplier)
                         if supplier == "vitraglass":
                             validated = VitraglassInvoiceSchema(**raw_data)
                             structured_data = validated.model_dump()
@@ -1077,19 +1180,18 @@ Retourne UNIQUEMENT le JSON valide sans commentaires."""
 
 def validate_node(state: AgentState) -> AgentState:
     """
-    Nœud 4 : Valide la cohérence des données extraites.
+    Nœud 4 : Vérification visuelle des données extraites (points d'ancrage textuels).
     """
     try:
         structured_data = state["structured_data"]
         doc_type = state["doc_type"]
+        supplier = state.get("supplier", "inconnu")
         
         if not structured_data:
             logger.warning("⚠️  Pas de données à valider")
             return {**state, "is_valid": False}
         
         logger.info(f"🔎 Validation des données ({doc_type})")
-        
-        # Validation de base : vérifier que les données essentielles sont présentes
         is_valid = True
         
         if doc_type == "facture":
@@ -1104,41 +1206,51 @@ def validate_node(state: AgentState) -> AgentState:
                 logger.warning("⚠️  Aucune ligne de facturation")
                 is_valid = False
             
-            # Validation comptable : somme des lignes vs total
-            if lignes and entete.get("total_ttc"):
-                total_ht_calculated = sum(line.get("total_ht", 0) or 0 for line in lignes)
-                # Calcul approximatif (on ne valide pas strictement car les remises peuvent varier)
-                if total_ht_calculated > 0:
-                    logger.info(f"   Total HT calculé : {total_ht_calculated:.2f}")
+            # Filtrer les lignes éco-contribution (polluent l'extraction)
+            lignes_filtrees = [
+                L for L in lignes
+                if not (L.get("designation") or "").lower().count("éco-contribution")
+                and not (L.get("designation") or "").lower().count("eco-contribution")
+            ]
+            if len(lignes_filtrees) < len(lignes):
+                structured_data["lignes"] = lignes_filtrees
+                logger.info(f"   Lignes éco-contribution exclues : {len(lignes) - len(lignes_filtrees)}")
+            
+            if supplier == "soprofen":
+                for i, line in enumerate(lignes_filtrees):
+                    ref = (line.get("reference_soi") or "").strip()
+                    total_ht = line.get("total_ht")
+                    remise = line.get("remise_pourcentage")
+                    if ref.upper().startswith("SOI") and (total_ht is None or (isinstance(total_ht, (int, float)) and total_ht <= 0)):
+                        logger.warning(f"⚠️  Ligne {i+1} : référence SOI sans Total EUR : {ref[:50]}...")
+                        is_valid = False
+                    # remise_pourcentage doit être entre 0 et 100 (sinon colonnes mélangées)
+                    if isinstance(remise, (int, float)) and (remise < 0 or remise > 100):
+                        logger.warning(f"⚠️  Ligne {i+1} : remise_pourcentage={remise} invalide (doit être 0-100). Colonnes probablement mélangées.")
+                        is_valid = False
+            
+            elif supplier == "vitraglass":
+                for i, line in enumerate(lignes_filtrees):
+                    hl = line.get("hauteur_largeur") or ""
+                    des = (line.get("designation") or "")
+                    if hl and not re.match(r"\d+\s*[x*×]\s*\d+", hl):
+                        logger.warning(f"⚠️  Ligne {i+1} : hauteur_largeur format invalide : {hl}")
+                    if des and "D.V." not in des and "d.v." not in des.lower():
+                        logger.warning(f"⚠️  Ligne {i+1} : designation sans D.V.")
         
         else:  # devis
             entete = structured_data.get("entete", {})
-            totaux = structured_data.get("totaux", {})
-            
             if not entete.get("numero_devis"):
                 logger.warning("⚠️  Numéro de devis manquant")
                 is_valid = False
-            
-            # Vérifier la cohérence des totaux
-            total_ht = totaux.get("total_ht", 0) or 0
-            total_tva = totaux.get("total_tva", 0) or 0
-            total_ttc = totaux.get("total_ttc", 0) or 0
-            
-            if total_ht > 0 and total_ttc > 0:
-                expected_ttc = total_ht + total_tva
-                diff = abs(expected_ttc - total_ttc)
-                if diff > 1:  # Tolérance de 1 euro
-                    logger.warning(f"⚠️  Incohérence des totaux : HT({total_ht}) + TVA({total_tva}) ≠ TTC({total_ttc})")
-                    is_valid = False
         
         if is_valid:
             logger.info("✅ Validation réussie")
         else:
             logger.warning("⚠️  Validation échouée, mais on continue...")
-            # On marque comme valide pour éviter la boucle infinie dans cette version
             is_valid = True
         
-        return {**state, "is_valid": is_valid}
+        return {**state, "structured_data": structured_data, "is_valid": is_valid}
     
     except Exception as e:
         logger.error(f"❌ Erreur lors de la validation : {str(e)}")
@@ -1204,8 +1316,8 @@ def build_graph():
     
     # Ajouter les nœuds
     workflow.add_node("partition", partition_node)
-    workflow.add_node("router", router_node)
-    workflow.add_node("detect_supplier", detect_supplier_node)
+    workflow.add_node("router_supplier", router_supplier_node)
+    workflow.add_node("reformat_markdown", reformat_markdown_node)
     workflow.add_node("extract", extract_node)
     workflow.add_node("validate", validate_node)
     workflow.add_node("store_db", store_db_node)
@@ -1214,9 +1326,9 @@ def build_graph():
     workflow.set_entry_point("partition")
     
     # Définir les transitions
-    workflow.add_edge("partition", "router")
-    workflow.add_edge("router", "detect_supplier")
-    workflow.add_edge("detect_supplier", "extract")
+    workflow.add_edge("partition", "router_supplier")
+    workflow.add_edge("router_supplier", "reformat_markdown")
+    workflow.add_edge("reformat_markdown", "extract")
     workflow.add_edge("extract", "validate")
     
     # Transition conditionnelle : retry ou store_db
@@ -1258,6 +1370,7 @@ def process_single_file(app, pdf_path: str, file_index: int, total_files: int) -
         "doc_markdown": None,
         "doc_type": None,
         "supplier": None,
+        "table_structure": None,
         "structured_data": None,
         "is_valid": False,
         "retry_count": 0,
@@ -1358,157 +1471,6 @@ def process_pdf_files(app, pdf_files: List[str]) -> tuple[int, int, float]:
 
 
 # ============================================================================
-# GESTIONNAIRE D'ÉVÉNEMENTS FICHIERS
-# ============================================================================
-
-class PDFFileHandler(FileSystemEventHandler):
-    """
-    Gestionnaire d'événements qui détecte l'ajout de fichiers PDF
-    et déclenche leur traitement.
-    Utilisé avec PollingObserver pour une détection fiable sur volumes Docker/Windows.
-    """
-    
-    def __init__(self, app, files_in_progress: set):
-        super().__init__()
-        self.app = app
-        self.files_in_progress = files_in_progress
-        self.processing_lock = threading.Lock()
-        self.pending_files = set()
-        self.known_files = set()  # Cache des fichiers déjà vus (évite les doublons)
-        self.debounce_timer = None
-        self.debounce_delay = 1.0  # Délai en secondes pour éviter les doublons
-    
-    def on_created(self, event: FileSystemEvent):
-        """Appelé lorsqu'un fichier ou dossier est créé."""
-        logger.debug(f"🔍 Événement détecté (created): {event.src_path}")
-        self._handle_file_event(event)
-    
-    def on_modified(self, event: FileSystemEvent):
-        """Appelé lorsqu'un fichier est modifié (utile pour les fichiers copiés progressivement)."""
-        logger.debug(f"🔍 Événement détecté (modified): {event.src_path}")
-        self._handle_file_event(event)
-    
-    def _handle_file_event(self, event: FileSystemEvent):
-        """Traite un événement de fichier."""
-        if event.is_directory:
-            return
-        
-        file_path = event.src_path
-        
-        # Vérifier si c'est un fichier PDF
-        if not file_path.lower().endswith('.pdf'):
-            logger.debug(f"   ⏭️  Ignoré (pas un PDF): {os.path.basename(file_path)}")
-            return
-        
-        # Normaliser le chemin
-        file_path = os.path.abspath(file_path)
-        
-        # Vérifier si le fichier est dans le répertoire input
-        input_dir_abs = os.path.abspath(INPUT_DIR)
-        if not file_path.startswith(input_dir_abs):
-            logger.debug(f"   ⏭️  Ignoré (hors du répertoire input): {file_path}")
-            return
-        
-        logger.info(f"📥 Nouveau fichier détecté : {os.path.basename(file_path)}")
-        
-        # Ajouter à la liste des fichiers en attente
-        with self.processing_lock:
-            # Ignorer si déjà connu (évite les doublons avec le polling)
-            if file_path in self.known_files:
-                logger.debug(f"   ⏭️  Fichier déjà connu, ignoré : {os.path.basename(file_path)}")
-                return
-            self.pending_files.add(file_path)
-        
-        # Utiliser un délai pour éviter de traiter un fichier en cours d'écriture
-        # et grouper plusieurs fichiers ajoutés rapidement
-        if self.debounce_timer:
-            self.debounce_timer.cancel()
-        
-        self.debounce_timer = threading.Timer(self.debounce_delay, self._process_pending_files)
-        self.debounce_timer.start()
-    
-    def _process_pending_files(self):
-        """Traite les fichiers en attente après le délai de debounce."""
-        with self.processing_lock:
-            if not self.pending_files:
-                return
-            
-            # Récupérer les fichiers à traiter
-            files_to_process = list(self.pending_files)
-            self.pending_files.clear()
-        
-        # Filtrer ceux qui sont déjà traités ou en cours
-        new_files = []
-        for file_path in files_to_process:
-            # Normaliser le chemin
-            file_path = os.path.abspath(file_path)
-            # Vérifier que le fichier existe et n'est plus en cours d'écriture
-            if not os.path.exists(file_path):
-                continue
-            
-            try:
-                # Vérifier que le fichier n'est plus en cours d'écriture
-                # En comparant la taille à deux moments différents (avec un petit délai)
-                size1 = os.path.getsize(file_path)
-                threading.Event().wait(0.1)  # Attendre 100ms
-                size2 = os.path.getsize(file_path)
-                
-                # Si la taille a changé, le fichier est encore en cours d'écriture
-                if size1 != size2:
-                    logger.info(f"⏳ Fichier en cours d'écriture, report du traitement : {os.path.basename(file_path)}")
-                    # Remettre dans la file d'attente pour traitement ultérieur
-                    with self.processing_lock:
-                        self.pending_files.add(file_path)
-                    # Reprogrammer le traitement après un délai supplémentaire
-                    self.debounce_timer = threading.Timer(self.debounce_delay, self._process_pending_files)
-                    self.debounce_timer.start()
-                    continue
-            except (OSError, IOError) as e:
-                logger.warning(f"⚠️  Erreur lors de la vérification du fichier {os.path.basename(file_path)} : {str(e)}")
-                continue
-            
-            # Vérifier si le fichier est déjà traité
-            if is_file_processed(os.path.basename(file_path)):
-                logger.info(f"⏭️  Fichier déjà traité, ignoré : {os.path.basename(file_path)}")
-                continue
-            
-            # Vérifier si le fichier est en cours (watcher ou upload API)
-            abs_path = os.path.abspath(file_path)
-            if abs_path in self.files_in_progress:
-                continue
-            
-            new_files.append(file_path)
-        
-        if not new_files:
-            return
-        
-        # Marquer les fichiers comme en cours de traitement
-        for f in new_files:
-            self.files_in_progress.add(os.path.abspath(f))
-        
-        try:
-            # Traiter les nouveaux fichiers
-            logger.info(f"🚀 Démarrage du traitement de {len(new_files)} fichier(s)...")
-            successful, failed, elapsed = process_pdf_files(self.app, new_files)
-            
-            logger.info("")
-            logger.info("🔄 Retour en mode surveillance...")
-            logger.info("   (En attente de nouveaux fichiers PDF dans 'input')")
-            logger.info("")
-        except Exception as e:
-            logger.error(f"❌ Erreur lors du traitement des fichiers : {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-        finally:
-            # Retirer les fichiers de l'ensemble après traitement
-            for f in new_files:
-                self.files_in_progress.discard(os.path.abspath(f))
-                # Ajouter au cache des fichiers connus
-                with self.processing_lock:
-                    self.known_files.add(f)
-
-
-# ============================================================================
 # FONCTION PRINCIPALE
 # ============================================================================
 
@@ -1533,12 +1495,6 @@ def main():
     logger.info(f"Parallélisme : {MAX_WORKERS} fichier(s) simultané(s)")
     logger.info("=" * 60)
     
-    # Démarrer FastAPI dans un thread séparé
-    api_thread = threading.Thread(target=start_fastapi, daemon=True)
-    api_thread.start()
-    logger.info("✅ Thread FastAPI démarré")
-    logger.info("")
-    
     # Construire le graphe (une seule instance partagée)
     logger.info("🔧 Construction du graphe LangGraph...")
     app = build_graph()
@@ -1550,69 +1506,23 @@ def main():
     global _files_in_progress_ref
     _files_in_progress_ref = files_in_progress  # partagé avec l'API upload
     
-    # Créer le gestionnaire d'événements
-    event_handler = PDFFileHandler(app, files_in_progress)
-    
-    # Initialiser le cache des fichiers connus avec les fichiers déjà traités
-    all_pdfs = glob.glob(os.path.join(INPUT_DIR, "*.pdf"))
-    for pdf_path in all_pdfs:
-        pdf_name = os.path.basename(pdf_path)
-        if is_file_processed(pdf_name):
-            event_handler.known_files.add(os.path.abspath(pdf_path))
-    
-    # Traiter les fichiers existants non traités au démarrage
-    existing_files = get_pending_pdf_files()
-    if existing_files:
-        logger.info(f"📂 {len(existing_files)} fichier(s) PDF existant(s) détecté(s), traitement...")
-        logger.info("")
-        try:
-            successful, failed, elapsed = process_pdf_files(app, existing_files)
-            # Ajouter les fichiers traités au cache
-            for pdf_path in existing_files:
-                event_handler.known_files.add(os.path.abspath(pdf_path))
-            logger.info("")
-            logger.info("🔄 Passage en mode surveillance des nouveaux fichiers...")
-            logger.info("")
-        except Exception as e:
-            logger.error(f"❌ Erreur lors du traitement des fichiers existants : {str(e)}")
-    
-    # Créer l'observateur PollingObserver (optimisé pour volumes Docker/Windows)
-    # timeout=POLL_INTERVAL définit l'intervalle de vérification en secondes
-    observer = Observer(timeout=POLL_INTERVAL)
-    observer.schedule(event_handler, INPUT_DIR, recursive=False)
-    
-    logger.info("🔄 Mode surveillance activé (PollingObserver)")
-    logger.info(f"   Intervalle de polling : {POLL_INTERVAL}s (optimisé pour volumes Docker/Windows)")
-    logger.info("   (Déposez des fichiers dans le répertoire 'input' pour les traiter)")
+    # Démarrer FastAPI dans un thread séparé
+    api_thread = threading.Thread(target=start_fastapi, daemon=True)
+    api_thread.start()
+    logger.info("✅ Thread FastAPI démarré")
     logger.info("")
-    
-    # Démarrer l'observateur
-    observer.start()
-    logger.info("✅ PollingObserver démarré avec succès")
+    logger.info("✅ Serveur prêt - Utilisez l'interface web pour traiter les documents")
     logger.info("")
     
     try:
-        # Maintenir le processus actif
-        logger.info("✅ Surveillance active, en attente de nouveaux fichiers...")
-        logger.info(f"   (Vérification automatique toutes les {POLL_INTERVAL}s)")
-        logger.info("")
-        observer.join()
+        # Maintenir le processus actif (FastAPI tourne en daemon)
+        while True:
+            threading.Event().wait(1)
     except KeyboardInterrupt:
         logger.info("")
         logger.info("=" * 60)
         logger.info("🛑 Arrêt demandé par l'utilisateur")
         logger.info("=" * 60)
-        observer.stop()
-    except Exception as e:
-        logger.error(f"❌ Erreur critique dans le gestionnaire de surveillance : {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        observer.stop()
-        raise
-    finally:
-        observer.join(timeout=5)
-        if observer.is_alive():
-            logger.warning("⚠️  L'observateur n'a pas pu s'arrêter proprement")
 
 
 if __name__ == "__main__":

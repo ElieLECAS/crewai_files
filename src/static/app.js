@@ -18,6 +18,9 @@ document.addEventListener("DOMContentLoaded", function () {
     initUploadSystem();
 });
 
+// Variable globale pour éviter les multiples instances de polling
+let globalPollingInterval = null;
+
 function initUploadSystem() {
     const uploadArea = document.getElementById("upload-area");
     if (!uploadArea) return;
@@ -161,26 +164,34 @@ function initUploadSystem() {
             );
             tasksCount.textContent = `${activeTasks.length} en cours`;
 
-            if (activeTasks.length === 0 && isProcessing) {
-                // Tout est fini, on rafraîchit les stats après un court délai
-                isProcessing = false;
-                setTimeout(() => {
-                    refreshStats();
-                }, 1000);
+            if (activeTasks.length === 0) {
+                // Plus de tâches actives
+                if (isProcessing) {
+                    // Tout est fini, on rafraîchit les stats après un court délai
+                    isProcessing = false;
+                    setTimeout(() => {
+                        refreshStats();
+                    }, 1000);
+                }
                 // Arrêter le polling quand il n'y a plus de tâches actives
                 stopPolling();
-            } else if (activeTasks.length > 0) {
+                if (tasksContainer) {
+                    tasksContainer.style.display = "none";
+                }
+            } else {
+                // Il y a des tâches actives
                 isProcessing = true;
-                tasksContainer.style.display = "block";
-            } else if (activeTasks.length === 0 && !isProcessing) {
-                // Pas de tâches actives et pas en cours de traitement, arrêter le polling
-                stopPolling();
+                if (tasksContainer) {
+                    tasksContainer.style.display = "block";
+                }
             }
             
             // Retourner le nombre de tâches actives pour la logique de démarrage
             return activeTasks.length;
         } catch (error) {
             console.error("Erreur lors de la récupération des statuts:", error);
+            // En cas d'erreur, arrêter le polling pour éviter les requêtes infinies
+            stopPolling();
             return 0;
         }
     }
@@ -232,15 +243,27 @@ function initUploadSystem() {
     }
 
     function startPolling() {
-        if (pollingInterval) return;
+        // Nettoyer tout intervalle existant (local ou global) avant d'en créer un nouveau
+        if (pollingInterval) {
+            clearInterval(pollingInterval);
+        }
+        if (globalPollingInterval) {
+            clearInterval(globalPollingInterval);
+            globalPollingInterval = null;
+        }
         fetchTaskStatus();
         pollingInterval = setInterval(fetchTaskStatus, 5000); // Polling toutes les 5 secondes
+        globalPollingInterval = pollingInterval; // Garder une référence globale
     }
 
     function stopPolling() {
         if (pollingInterval) {
             clearInterval(pollingInterval);
             pollingInterval = null;
+        }
+        if (globalPollingInterval) {
+            clearInterval(globalPollingInterval);
+            globalPollingInterval = null;
         }
     }
 
@@ -284,11 +307,21 @@ function initUploadSystem() {
         }
     }
 
-    // Charger les statuts une seule fois au démarrage pour vérifier s'il y a des tâches actives
+    // Charger les statuts une seule fois au démarrage pour afficher les tâches existantes
+    // Ne PAS démarrer le polling automatiquement - seulement après un upload récent
+    // Le polling sera démarré uniquement après un nouvel upload (ligne 134)
     fetchTaskStatus().then((activeCount) => {
-        // Si des tâches sont actives, démarrer le polling
+        // Afficher les tâches existantes mais ne pas démarrer le polling automatiquement
         if (activeCount > 0) {
-            startPolling();
+            isProcessing = true;
+            if (tasksContainer) {
+                tasksContainer.style.display = "block";
+            }
+            // Ne démarrer le polling que si on vient vraiment de faire un upload
+            // (le polling sera démarré par startPolling() après l'upload, ligne 134)
+        } else {
+            // S'assurer que le polling est arrêté s'il n'y a pas de tâches
+            stopPolling();
         }
     });
 }

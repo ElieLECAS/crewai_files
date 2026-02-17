@@ -15,6 +15,24 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "documents_db")
 # Client MongoDB global (singleton)
 _client: Optional[MongoClient] = None
 _db = None
+_indexes_created = False
+
+
+def _ensure_indexes(db) -> None:
+    """Crée les index pour accélérer les requêtes fréquentes."""
+    global _indexes_created
+    if _indexes_created:
+        return
+    try:
+        for coll_name in ["factures", "devis", "bons_livraison"]:
+            coll = db[coll_name]
+            coll.create_index("metadata.fichier_source")
+            coll.create_index("metadata.nom_fournisseur")
+            coll.create_index([("metadata.date_extraction", -1)])
+        _indexes_created = True
+        logger.info("✅ Index MongoDB créés")
+    except Exception as e:
+        logger.warning(f"⚠️ Création index MongoDB : {e}")
 
 
 def get_connection():
@@ -32,6 +50,7 @@ def get_connection():
             )
             _client.admin.command('ping')
             _db = _client[MONGO_DB_NAME]
+            _ensure_indexes(_db)
             logger.info(f"✅ Connexion MongoDB établie : {MONGO_HOST}:{MONGO_PORT}/{MONGO_DB_NAME}")
         except Exception as e:
             logger.error(f"❌ Erreur connexion MongoDB : {str(e)}")
@@ -107,23 +126,14 @@ def get_all_suppliers():
     """Récupère la liste de tous les fournisseurs uniques à travers toutes les collections."""
     try:
         db = get_connection()
-        suppliers_data = {}
+        suppliers = set()
         for coll_name in ["factures", "devis", "bons_livraison"]:
-            # On récupère les noms de fournisseurs uniques et leurs IDs
-            docs = db[coll_name].find({}, {"metadata.nom_fournisseur": 1, "metadata.fournisseur_id": 1})
-            for doc in docs:
-                name = doc.get("metadata", {}).get("nom_fournisseur")
-                sid = doc.get("metadata", {}).get("fournisseur_id")
-                if name and name != "inconnu":
-                    suppliers_data[name] = sid
-        
-        result = []
-        for name in sorted(suppliers_data.keys()):
-            result.append({
-                "id": suppliers_data[name],
-                "name": name
-            })
-        return result
+            names = db[coll_name].distinct("metadata.nom_fournisseur")
+            suppliers.update(n for n in names if n and n != "inconnu")
+        return [
+            {"id": name.lower().strip().replace(" ", "_"), "name": name}
+            for name in sorted(suppliers)
+        ]
     except Exception as e:
         logger.error(f"Erreur lors de la récupération des fournisseurs : {str(e)}")
         return []

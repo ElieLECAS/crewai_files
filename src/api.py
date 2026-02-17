@@ -1,6 +1,7 @@
 import os
 import shutil
 import logging
+import time
 import uuid
 import asyncio
 import pandas as pd
@@ -49,6 +50,18 @@ executor = ThreadPoolExecutor(max_workers=3)
 # Format : {task_id: {status: str, file_name: str, message: str, success: bool, timestamp: datetime}}
 task_status = {}
 
+# Cache des stats (TTL 30s)
+_stats_cache: dict = {"data": None, "ts": 0}
+STATS_CACHE_TTL = 30
+
+
+def invalidate_stats_cache() -> None:
+    """Invalide le cache des stats (après insertion d'un document)."""
+    global _stats_cache
+    _stats_cache["data"] = None
+    _stats_cache["ts"] = 0
+
+
 def get_langgraph_app():
     """Récupère ou crée l'instance du graphe LangGraph."""
     global _langgraph_app
@@ -71,14 +84,17 @@ def convert_objectid(obj):
 
 
 def get_collection_stats():
-    """Récupère les statistiques de toutes les collections."""
+    """Récupère les statistiques de toutes les collections (cache TTL 30s)."""
+    global _stats_cache
+    now = time.time()
+    if _stats_cache["data"] is not None and (now - _stats_cache["ts"]) < STATS_CACHE_TTL:
+        return _stats_cache["data"]
     db = get_connection()
     collections = {
         "factures": db["factures"],
         "devis": db["devis"],
         "bons_livraison": db["bons_livraison"]
     }
-    
     stats = {}
     for name, collection in collections.items():
         count = collection.count_documents({})
@@ -86,7 +102,8 @@ def get_collection_stats():
             "count": count,
             "display_name": name.replace("_", " ").title()
         }
-    
+    _stats_cache["data"] = stats
+    _stats_cache["ts"] = now
     return stats
 
 
@@ -349,7 +366,7 @@ def run_processing_task(task_id: str, file_path: str, filename: str):
             task_status[task_id]["status"] = "completed"
             task_status[task_id]["success"] = True
             task_status[task_id]["message"] = f"Fichier {filename} traité avec succès en {elapsed:.1f}s"
-            
+            invalidate_stats_cache()
             # Supprimer le PDF de input après traitement réussi
             if os.path.exists(file_path):
                 try:
@@ -404,12 +421,12 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
         task_id = str(uuid.uuid4())
         file_path = os.path.join(INPUT_DIR, file.filename)
         
+        # Marquer comme en cours AVANT de sauvegarder (évite que le watcher le traite en parallèle)
+        register_file_in_progress(file_path)
+        
         # Sauvegarder le fichier immédiatement
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
-        # Marquer comme en cours tout de suite (évite que le watcher le traite en parallèle)
-        register_file_in_progress(file_path)
         
         # Initialiser le statut
         task_status[task_id] = {
