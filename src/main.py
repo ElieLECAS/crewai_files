@@ -35,7 +35,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:1143
 MODEL = os.getenv("MODEL", "glm-ocr:q8_0")
 MODEL_EXTRACT = os.getenv("MODEL_EXTRACT") or MODEL  # Modèle pour extraction (optionnel, défaut=MODEL)
 TIMEOUT = int(os.getenv("TIMEOUT", "600"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))  # Nombre de fichiers à traiter en parallèle
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Nombre de fichiers à traiter en parallèle
 # Limite de caractères du document envoyée à l'extraction (réduire si 500 avec glm-ocr)
 EXTRACT_MAX_CHARS = int(os.getenv("EXTRACT_MAX_CHARS", "4000"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
